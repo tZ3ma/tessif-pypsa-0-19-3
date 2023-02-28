@@ -1,16 +1,14 @@
-"""Wrapping the oemof optimization process."""
-import numbers
-
-from oemof import solph
+"""Wrapping the pypsa optimization process."""
+from tessif.frused.utils import HideStdoutPrinting
 
 
-def optimize(energy_system, solver="cbc", **kwargs):
-    """Optimize oemof system model
+def optimize(system_model, solver="cbc", **kwargs):
+    """Optimize a PyPSA system model.
 
     Parameters
     ----------
-    energy_system: ~oemof.energy_system.EnergySystem
-        Oemof energy system to be simulated.
+    system_model: pypsa.Network
+        Pypsa energy system to be simulated
 
     solver: str, default='cbc'
         String specifying the solver to be used. For `FOSS
@@ -22,9 +20,11 @@ def optimize(energy_system, solver="cbc", **kwargs):
         <https://pyomo.readthedocs.io/en/stable/solving_pyomo_models.html#supported-solvers>`_
         can be used.
 
+        Pypsa also allows using its own solver. Archieved by passing ``pypsa``.
+
         Note
         ----
-        In case the link above is servered, use the pyomo cli command::
+        In case the link above is servered, use the pyomo command::
 
             pyomo help --solvers
 
@@ -32,63 +32,24 @@ def optimize(energy_system, solver="cbc", **kwargs):
         Keywords parameterizing the solver used as well as the energy system
         transformation process.
 
-        Use one of :meth:`solve's <oemof.solph.models.BaseModel.solve>`
+        Use one of :meth:`lopf's <pypsa.Network.lopf>`
         parameters for tweaking the solver.
 
     Return
     ------
-    optimized_es : :class:`~oemof.energy_system.EnergySystem`
+    Optimized PyPSA system model
         Energy system carrying the optimization results.
     """
-    # Default solver kwargs
-    skwargs = {
-        "solver_io": "lp",
-        "solve_kwargs": {},
-        "cmdline_options": {},
-    }
+    if solver == "pypsa":
+        pyomo = False
+    else:
+        pyomo = True
 
-    # Seperate the kwargs:
-    for key in skwargs.keys():
-        if key in kwargs.keys():
-            skwargs.update({key: kwargs.pop(key)})
+    kwargs["solver_name"] = solver
 
-    # enforce solver from argument:
-    skwargs["solver"] = solver
+    # 5.) Optimize model:
+    # supress solver results getting printed to stdout
+    with HideStdoutPrinting():
+        system_model.lopf(pyomo=pyomo, **kwargs)
 
-    # Prepare the optimization problem
-    om = solph.Model(energy_system)
-
-    # Parse global constraints (potentially added by a tessif transformation)
-    if hasattr(energy_system, "global_constraints"):
-        for constraint, value in energy_system.global_constraints.items():
-
-            if isinstance(value, numbers.Number):
-                om = solph.constraints.generic_integral_limit(
-                    om=om, keyword=constraint, limit=value
-                )
-
-    om.solve(**skwargs)
-
-    # Pump results into the model:
-    energy_system.results["main"] = solph.processing.results(om)
-    energy_system.results["meta"] = solph.processing.meta_results(om)
-
-    # parse global results
-    energy_system.results["global"] = dict()
-
-    # Parse global constraint results (potentially added by a tessif
-    # transformation)
-    if hasattr(energy_system, "global_constraints"):
-        for constraint, value in energy_system.global_constraints.items():
-
-            if isinstance(value, numbers.Number):
-                energy_system.results["global"][constraint] = getattr(
-                    om, "integral_limit_{}".format(constraint)
-                )()
-
-    energy_system.results["global"]["costs"] = energy_system.results["meta"][
-        "objective"
-    ]
-
-    # Return the optimized oemof energy system
-    return energy_system
+    return system_model

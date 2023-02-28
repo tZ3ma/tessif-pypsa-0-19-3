@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "tessif-pypsa-0-19-3"
-version = "0.0.1"
+version = "0.1.0"
 description = "Tessif-Plugin for providing pypsa version 0.19.3 support."
 authors = ["Mathias Ammon <tz3ma.coding@use.startmail.com>"]
 license = "MIT"
@@ -13,6 +13,7 @@ keywords = ["Tessif", "Tessif-PyPSA", "ESSMOS", "optimization", "energy supply s
 python = "^3.8"
 pypsa = "0.19.3"
 tessif = ">=0.0.24"
+pyomo = "<6.0.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.1.2"

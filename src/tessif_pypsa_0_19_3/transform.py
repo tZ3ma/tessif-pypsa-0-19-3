@@ -1,1399 +1,1717 @@
+# src/tessif_pypsa_0_19_3/transform.py
+"""Tessif system model to pypsa system model transformation.
+
+:mod:`tessif_pypsa_0_19_3.transform` is a :mod:`tessif_pypsa_0_19_3` module
+aggregating all the functionality for automatically transforming a
+:class:`tessif system model <tessif.energy_system.AbstractEnergySystem>` into a
+:class:`pypsa energy system <pypsa.Network>`.
 """
-:mod:`tessif_pypsa_0_19_3.es2es` is a module aggregating all the
-functionality for automatically transforming a :class:`tessif energy system
-<tessif.model.energy_system.AbstractEnergySystem>` into an
-:class:`oemof energy system <oemof.core.energy_system.EnergySystem>`.
-"""
+
 import collections
 import logging
 import numbers
-from warnings import warn
 
 import numpy as np
-import oemof.solph as solph
-import tessif.frused.namedtuples as nts
-from tessif.frused import spellings
-from tessif import components
+import pandas as pd
+import pypsa
 
+from tessif.frused.spellings import (
+    connector,
+    combined_heat_power,
+    heat_plant,
+    power_plant,
+    power2x,
+    power2heat,
+    flow_emissions as spellings_flow_emissions,
+)
+import tessif.hooks.ppsa as pypsa_hooks
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 logger = logging.getLogger(__name__)
 
 
-def _to_oemof_conversions(tessif_conversions):
+def infer_pypsa_transformer_types(tessif_transformers, forced_links=None):
     """
-    Translate tessif's conversions dictionairy into oemof's.
+    Utility to infer how tessif transformers should be transformed into pypsa
+    components.
+
+    :class:`Tessif transformers <tessif.model.components.Transformer>`
+    can have singular or multiple outputs and therefor be both:
+
+        - `Pypsa links
+          <https://pypsa.readthedocs.io/en/latest/components.html#link>`_
+          (if #(outputs) > 1)
+        - `Pypsa generators
+          <https://pypsa.readthedocs.io/en/latest/components.html#generator>`_
+          (if #(inputs) == #(outputs) == 1)
+
+    For a tessif transformer being transformed into a pypsa link, **one** of
+    the following has to be true:
+
+        - :paramref:`Transformer.node_type
+          <tessif.model.components.Transformer.node_type>` is found inside
+          :attr:`tessif.frused.spellings.combined_heat_power`
+
+        - number of :attr:`Transformer.outputs
+          <tessif.model.components.Transformer.outputs>` > 1
+
+    On the other hand, for a tessif transformer beeing transformed into a
+    pypsa generator, **one** of the following has to be true:
+
+        - :paramref:`Transformer.node_type
+          <tessif.model.components.Transformer.node_type>` is found inside
+          :attr:`tessif.frused.spellings.power_plant` or inside
+          :attr:`tessif.frused.spellings.heat_plant`.
+
+        - number of :attr:`Transformer.outputs
+          <tessif.model.components.Transformer.outputs>` equals
+          number of :attr:`Transformer.inputs
+          <tessif.model.components.Transformer.outputs>` equals
+          1.
 
     Parameters
     ----------
-    tessif_conversions: dict
-        Tessif's :paramref:`efficiency map
-        <tessif.model.component.Transformer.conversions>`
+    tessif_transformers: ~collections.abc.Iterable
+        Iterable of tessif transformers of which the appropriate
+        transformation type is to be inferred.
+    forced_links: ~collections.abc.Container, None, default=None
+        Container of :ref:`uid representations <Labeling_Concept>` of
+        :class:`tessif transformers <tessif.model.components.Transformer>`
+        to be transfrormed into `pypsa links
+        <https://pypsa.readthedocs.io/en/latest/components.html#link>`_.
 
     Return
     ------
-    oemof_conversions: dict
-        Oemof's :class:`efficiency map <oemof.solph.network.transformer.Transformer>`
-
-    Example
-    -------
-    >>> convs = {('fuel', 'electricity'): 0.3, ('air', 'electricity'): 0.2,
-    ...          ('fuel', 'heat'): 0.4, ('air', 'heat'): 0.25, }
-    >>> print(_to_oemof_conversions(convs))
-    {'electricity': 0.3, 'air': 0.1111111111111111, 'heat': 0.4}
+    inferred_transformers: dict
+        Mapping of :class:`Tessif transformer
+        <tessif.model.components.Transformer>` uids keyed either by
+        ``links`` or by ``generators``
     """
-    oemof_conversions = dict()
-    for tple, factor in tessif_conversions.items():
-        if tple[1] not in oemof_conversions:
-            oemof_conversions[tple[1]] = factor
-        elif tple[0] not in oemof_conversions:
-            oemof_conversions[tple[0]] = factor
-        else:
-            oemof_conversions[tple[0]] = 1 / (
-                1 / oemof_conversions[tple[0]] + 1 / factor
-            )
-
-    return oemof_conversions
-
-
-def _parse_oemof_flow_parameters(component, target):
-
-    # oemof interprets many parameters as normalized to the nominal value
-    # tessif components do not specify a nominal value directly
-    # they implicate it though through their flow rates.
-
-    nominal_value = component.flow_rates[target].max
-    if isinstance(nominal_value, collections.abc.Iterable):
-        nominal_value = max(nominal_value)
-
-    # linear flow parameters
-    flow_params = dict()
-    if nominal_value != float("inf"):
-
-        # in some rare cases nominal value is 0. For ie reading external
-        # renewable data for only a certain period, where there is no output
-        if nominal_value == 0:
-            flow_params.update(
-                {
-                    "nominal_value": nominal_value,
-                    # linear gradient flow parameters
-                    "positive_gradient": {
-                        "ub": component.flow_gradients[target].positive,
-                        "costs": component.gradient_costs[target].positive,
-                    },
-                    "negative_gradient": {
-                        "ub": component.flow_gradients[target].negative,
-                        "costs": component.gradient_costs[target].negative,
-                    },
-                }
-            )
-        else:
-            # oemof uses specific values for the following set of parameters.
-            flow_params.update(
-                {
-                    "nominal_value": nominal_value,
-                    "min": component.flow_rates[target].min / nominal_value,
-                    "max": component.flow_rates[target].max / nominal_value,
-                    # linear gradient flow parameters
-                    "positive_gradient": {
-                        "ub": component.flow_gradients[target].positive,
-                        "costs": component.gradient_costs[target].positive,
-                    },
-                    "negative_gradient": {
-                        "ub": component.flow_gradients[target].negative,
-                        "costs": component.gradient_costs[target].negative,
-                    },
-                }
-            )
-    else:
-        if component.timeseries:
-            if component.timeseries[target] is not None:
-                # preset nominal value in case a timeseries is used
-                # to parse specific values and existing when dealing with
-                # expandable values
-                flow_params["nominal_value"] = max(
-                    component.timeseries[target].max)
-                nominal_value = flow_params["nominal_value"]
-            else:
-                flow_params["nominal_value"] = nominal_value
-        else:
-            flow_params["nominal_value"] = nominal_value
-
-        flow_params["min"] = 0.0
-        flow_params["max"] = 1.0
-
-        # linear gradient flow parameters
-        flow_params["positive_gradient"] = {
-            "ub": float("inf"),
-            "costs": component.gradient_costs[target].positive,
-        }
-        flow_params["negative_gradient"] = {
-            "ub": float("inf"),
-            "costs": component.gradient_costs[target].negative,
-        }
-
-    # optimization targets:
-    flow_params.update(
-        {
-            "variable_costs": component.flow_costs[target],
-            "emissions": component.flow_emissions[target],
-        }
-    )
-
-    # component specific linear flow params:
-    if hasattr(component, "accumulated_amounts"):
-        if target in component.accumulated_amounts:
-            # parse minimum = 0 to None, to match oemof:
-            if component.accumulated_amounts[target].min == 0:
-                summed_min = None
-            else:
-                summed_min = component.accumulated_amounts[target].min / \
-                    nominal_value
-
-            if component.accumulated_amounts[target].max == float("inf"):
-                summed_max = None
-            else:
-                summed_max = component.accumulated_amounts[target].max / \
-                    nominal_value
-
-            flow_params.update(
-                {
-                    "summed_min": summed_min,
-                    "summed_max": summed_max,
-                }
-            )
-
-    # expansion problem parameters:
-    if component.expandable[target]:
-        flow_params.pop("positive_gradient")
-        flow_params.pop("negative_gradient")
-        max_expansion = (
-            component.expansion_limits[target].max -
-            flow_params["nominal_value"]
-        )
-        min_expansion = (
-            component.expansion_limits[target].min -
-            flow_params["nominal_value"]
-        )
-
-        if max_expansion < 0:
-            msg = (
-                "Requested maximum expansion limit of "
-                + f"'{component.expansion_limits[target].max}' of flow "
-                f"'{target}' of component '{component.uid.name}' is below "
-                "current installed capacity of "
-                f"'{flow_params['nominal_value']}'. Falling back on current "
-                "installed capacity as maximum."
-            )
-            logger.warning(msg)
-            max_expansion = flow_params["nominal_value"]
-
-        elif max_expansion == float("+inf"):
-            # oemofs inf expansion == None
-            max_expansion = None
-
-        if min_expansion < 0:
-            msg = (
-                "Requested minimum expansion limit of "
-                + f"'{component.expansion_limits[target].min}' of the flow "
-                f"'{target}' of component '{component.uid.name}' is below "
-                "current installed capacity of "
-                f"'{flow_params['nominal_value']}'. Falling back on 0.0 as "
-                "minimum additionally installed capacity."
-            )
-            logger.warning(msg)
-            min_expansion = 0.0
-
-        flow_params.update(
-            {
-                "investment": solph.Investment(
-                    # oemof min/max are interpreted as additional limits where as
-                    # tessif sees them as absolute values
-                    maximum=max_expansion,
-                    minimum=min_expansion,
-                    ep_costs=component.expansion_costs[target],
-                    existing=flow_params["nominal_value"],
-                ),
-                "nominal_value": None,
-            }
-        )
-
-    # nonconvex problem parameters:
-    if component._milp[target]:
-        flow_params.update(
-            {
-                "nonconvex": solph.NonConvex(
-                    startup_costs=component.status_changing_costs.on,
-                    shutdown_costs=component.status_changing_costs.off,
-                    activity_costs=component.costs_for_being_active,
-                    minimum_uptime=component.status_inertia.on,
-                    minimum_downtime=component.status_inertia.off,
-                    maximum_startups=component.number_of_status_changes.on,
-                    maximum_shutdowns=component.number_of_status_changes.off,
-                    initial_status=component.initial_status,
-                )
-            }
-        )
-
-    # chp parameters
-    if isinstance(component, components.CHP):
-        flow_params.update(
-            {
-                "H_L_FG_share_max": getattr(component.enthalpy_loss, "max", None),
-                "H_L_FG_share_min": getattr(component.enthalpy_loss, "min", None),
-                "P_max_woDH": getattr(component.power_wo_dist_heat, "max", None),
-                "P_min_woDH": getattr(component.power_wo_dist_heat, "min", None),
-                "Eta_el_max_woDH": getattr(
-                    component.el_efficiency_wo_dist_heat, "max", None
-                ),
-                "Eta_el_min_woDH": getattr(
-                    component.el_efficiency_wo_dist_heat, "min", None
-                ),
-                "Q_CW_min": component.min_condenser_load,
-            }
-        )
-
-    # timeseries parameters
-    if component.timeseries:
-        if target in component.timeseries:
-            # enforce float type in case 'inf' strings were parsed
-            minimum = np.array(component.timeseries[target][0]).astype(float)
-            maximum = np.array(component.timeseries[target][1]).astype(float)
-
-            # in some rare cases nominal value is 0. For ie reading external
-            # renewable data for only a certain period, where there is no
-            # output
-            if nominal_value != 0:
-                flow_params.update(
-                    {
-                        # use tuple indexing cause timeseries read in from
-                        # external sources my prohibit use of namedtuple syntax
-                        "min": minimum / nominal_value,
-                        "max": maximum / nominal_value,
-                    }
-                )
-            else:
-                flow_params.update(
-                    {
-                        # use tuple indexing cause timeseries read in from
-                        # external sources my prohibit use of namedtuple syntax
-                        "min": minimum,
-                        "max": maximum,
-                    }
-                )
-
-    # replace tessif's infinity values with None, so oemof can handle them:
-    for key, v in flow_params.copy().items():
-        if key in ("positive_gradient", "negative_gradient"):
-            if flow_params[key]["ub"] == float("inf"):
-                flow_params[key]["ub"] = None
-
-        # only consider numeric values
-        # if key != 'nominal_value':
-        if isinstance(v, numbers.Number):
-            if v == float("inf"):
-                flow_params[key] = None
-
-    if not isinstance(flow_params["max"], collections.abc.Iterable):
-        if np.isnan(flow_params["max"]):
-            flow_params["max"] = 1.0
-
-    return flow_params
-
-
-def _generate_oemof_bus_connection_flows(oemof_busses, tessif_busses):
-    """ """
-    bus_dict = {bus.label.name: bus for bus in oemof_busses}
-
-    print(30 * "-")
-    print("Inside connection flows:")
-
-    for outer_bus in tessif_busses:
-        outputs = dict()
-        inputs = dict()
-        print(outer_bus.uid)
-        for inner_bus in tessif_busses:
-            for inflow in inner_bus.inputs:
-                if str(outer_bus.uid) in inflow:
-                    print(
-                        "Constructing flow from {} to {} for {}".format(
-                            outer_bus.uid, inner_bus.uid, outer_bus.uid
-                        )
-                    )
-                    outputs[bus_dict[inner_bus.uid.name]] = solph.Flow()
-
-            print(50 * "-")
-            for outflow in inner_bus.outputs:
-                if str(outer_bus.uid) in outflow:
-                    print(
-                        "Constructing flow from {} to {} for {}".format(
-                            inner_bus.uid, outer_bus.uid, outer_bus.uid
-                        )
-                    )
-
-                    inputs[bus_dict[inner_bus.uid.name]] = solph.Flow()
-                    print(inputs)
-                    print(50 * "=")
-
-        b = solph.Bus(
-            label=nts.Uid(*outer_bus.uid),
-            # inputs=inputs,
-            # balanced=False,
-            outputs=outputs,
-        )
-        print(b.inputs)
-        print(b.outputs)
-        yield b
-
-
-def generate_oemof_busses(busses):
-    """
-    Generates oemof busses out of tessif busses.
-
-    Parameters
-    ----------
-    busses: ~collections.abc.Iterable
-        Iterable of :class:`tessif.model.components.Bus` objects that are to
-        be transformed into :class:`oemof.solph.network.bus.Bus` objects.
-
-    Return
-    ------
-    generated_busses :class:`~collections.abc.Generator`
-        Generator object yielding the transformed :class:`bus objects
-        <oemof.solph.network.bus.Bus>`.
-    """
-    tessif_busses = list(busses)
-
-    # return _generate_oemof_bus_connection_flows(oemof_busses, tessif_busses)
-    for bus in tessif_busses:
-        yield solph.Bus(
-            label=nts.Uid(*bus.uid),
-        )
-
-
-def generate_oemof_chps(chps, tessif_busses, oemof_busses):
-    """Generate oemof chps out of tessif chps
-
-    Parameters
-    ----------
-    chps: ~collections.abc.Iterable
-        Iterable of :class:`tessif.model.components.CHP` objects that
-        are to be transformed into
-        :class:`oemof.solph.components.extraction_turbine_chp.ExtractionTurbineCHP`
-        or :class:`oemof.solph.components.generic_chp.GenericCHP` objects.
-
-    tessif_busses: ~collections.abc.Iterable
-        Collection of :class:`tessif.model.components.Bus` objects present
-        in the same energy system as
-        :paramref:`~generate_oemof_chps.chps`.
-
-        Used for figuring out connections.
-
-    oemof_busses: ~collections.abc.Iterable
-        Iterable of :class:`oemof.solph.network.bus.Bus` objects present in the
-        same energy system as
-        :paramref:`~generate_oemof_chps.chps`.
-
-        Used for figuring out connections.
-
-    Return
-    ------
-    generated_chps :class:`~collections.abc.Generator`
-        Generator object yielding the transformed :class:`chp objects
-        <oemof.solph.network.bus.Bus>`.
-
-    Examples
-    --------
-    >>> # utilize example hub for accessing a parameterized energy system
-    >>> import tessif.examples.data.tsf.py_hard as tsf_py
-    >>> es = tsf_py.create_variable_chp()
-
-    >>> # generate the chps:
-    >>> chp = list(generate_oemof_chps(
-    ...     chps=es.chps,
-    ...     tessif_busses=es.busses,
-    ...     oemof_busses=generate_oemof_busses(es.busses)))[0]
-
-    Label:
-
-    >>> print(chp.label)
-    CHP1
-
-    Conversion Factors:
-
-    >>> for key, value in chp.conversion_factors.items():
-    ...     print('{}: {}'.format(key, value[123123]))
-    Powerline: 0.3
-    Heat Grid: 0.2
-    Gas Grid: 1
-
-    >>> linear_flow_params = (
-    ...     'nominal_value', 'summed_min', 'summed_max',
-    ...     'min', 'max', 'positive_gradient', 'negative_gradient')
-
-    >>> for flow in list(
-    ...     chp.inputs.values())+list(chp.outputs.values()):
-    ...     print("Flow from '{}' to '{}'".format(
-    ...         flow.label.input, flow.label.output))
-    ...     print('Linear flow parameters')
-    ...     for attr in linear_flow_params:
-    ...         print('{}:'.format(attr), getattr(flow, attr))
-    ...     print()
-    Flow from 'Gas Grid' to 'CHP1'
-    Linear flow parameters
-    nominal_value: None
-    summed_min: None
-    summed_max: None
-    min: []
-    max: []
-    positive_gradient: {'ub': [], 'costs': 0.0}
-    negative_gradient: {'ub': [], 'costs': 0.0}
-    <BLANKLINE>
-    Flow from 'CHP1' to 'Powerline'
-    Linear flow parameters
-    nominal_value: 9
-    summed_min: None
-    summed_max: None
-    min: []
-    max: []
-    positive_gradient: {'ub': [], 'costs': 0.0}
-    negative_gradient: {'ub': [], 'costs': 0.0}
-    <BLANKLINE>
-    Flow from 'CHP1' to 'Heat Grid'
-    Linear flow parameters
-    nominal_value: 6
-    summed_min: None
-    summed_max: None
-    min: []
-    max: []
-    positive_gradient: {'ub': [], 'costs': 0.0}
-    negative_gradient: {'ub': [], 'costs': 0.0}
-    <BLANKLINE>
-    """
-    bus_dict = {bus.label.name: bus for bus in oemof_busses}
-    tessif_busses = list(tessif_busses)
-
-    for chp in chps:
-        # dicts being passed to create the transformer
-        inputs = dict()
-        outputs = dict()
-        electrical_output = dict()
-        heat_output = dict()
-        conversion_factors = dict()
-        cffc = dict()
-
-        # temp dict for translating tessif's conversions to oemof's
-        oemof_conversions = {}
-        oemof_cffc = {}
-        if chp.conversions:
-            oemof_conversions = _to_oemof_conversions(chp.conversions)
-        if chp.conversion_factor_full_condensation:
-            oemof_cffc = _to_oemof_conversions(
-                chp.conversion_factor_full_condensation)
-        for bus in tessif_busses:
-            for input_ in chp.inputs:
-                bus_id = ".".join([chp.uid.name, input_])
-                if bus_id in bus.outputs:
-
-                    # parse conversion factor if applicable:
-                    if input_ in oemof_conversions:
-                        conversion_factors[bus_dict[bus.uid.name]] = oemof_conversions[
-                            input_
-                        ]
-
-                    # parse input flow (oemof flows are keyed to objects!)
-                    inputs[bus_dict[bus.uid.name]] = solph.Flow(
-                        **_parse_oemof_flow_parameters(chp, input_)
-                    )
-
-            for output in chp.outputs:
-                bus_id = ".".join([chp.uid.name, output])
-                if bus_id in bus.inputs:
-
-                    # parse conversion factor if applicable:
-                    if output in oemof_conversions:
-                        conversion_factors[bus_dict[bus.uid.name]] = oemof_conversions[
-                            output
-                        ]
-
-                    # parse conversion factor for full condensation if
-                    # applicable:
-                    if output in oemof_cffc:
-                        cffc[bus_dict[bus.uid.name]] = oemof_cffc[output]
-
-                    # parse input flow (oemof flows are keyed to objects!)
-                    outputs[bus_dict[bus.uid.name]] = solph.Flow(
-                        **_parse_oemof_flow_parameters(chp, output)
-                    )
-
-                    # Split the outputs into electrical and heat outputs.
-                    if any(variation in output for variation in spellings.power):
-                        electrical_output[bus_dict[bus.uid.name]] = solph.Flow(
-                            **_parse_oemof_flow_parameters(chp, output)
-                        )
-                    if any(variation in output for variation in spellings.heat):
-                        heat_output[bus_dict[bus.uid.name]] = solph.Flow(
-                            **_parse_oemof_flow_parameters(chp, output)
-                        )
-
-        # Decide which oemof component to use depending on the given properties
+    # make forced links iterable:
+    if forced_links is None:
+        forced_links = tuple()
+
+    # create appropriate containers
+    inferred_transformers = {
+        'generators': list(),
+        'links': list(),
+    }
+
+    # seperate links and generators
+    for transformer in tessif_transformers:
+        # links
         if (
-            len(chp.conversion_factor_full_condensation) > 0
-            and len(chp.conversions) == 0
+                str(transformer.uid) in forced_links
+                or transformer.uid.node_type in [
+                    *combined_heat_power, *connector]
+                or len(transformer.outputs) > 1
+                or transformer.uid.name in [
+                    *power2x,
+                    *power2heat,
+                ]
         ):
-            warn(
-                "'%s' will be ignored. Has unsupported combination of"
-                " parameters." % chp.uid.name
-            )
-        elif len(chp.conversion_factor_full_condensation) > 0:
-            yield solph.ExtractionTurbineCHP(
-                label=nts.Uid(*chp.uid),
-                inputs=inputs,
-                outputs=outputs,
-                conversion_factors=conversion_factors,
-                conversion_factor_full_condensation=cffc,
-            )
-        elif len(chp.conversions) == 0:
-            yield solph.GenericCHP(
-                label=nts.Uid(*chp.uid),
-                fuel_input=inputs,
-                electrical_output=electrical_output,
-                heat_output=heat_output,
-                Beta=chp.power_loss_index,
-                back_pressure=chp.back_pressure,
-            )
-        else:
-            yield solph.Transformer(
-                label=nts.Uid(*chp.uid),
-                outputs=outputs,
-                inputs=inputs,
-                conversion_factors=conversion_factors,
-            )
-
-
-def generate_oemof_links(links, tessif_busses, oemof_busses):
-    """
-    Generates oemof links out of tessif links.
-
-    Parameters
-    ----------
-    links: ~collections.abc.Iterable
-        Iterable of :class:`tessif.model.components.Link` objects that are to
-        be transformed into :class:`oemof.solph.custom.link.Link` objects.
-
-    tessif_busses: ~collections.abc.Iterable
-        Collection of :class:`tessif.model.components.Bus` objects present
-        in the same energy system as :paramref:`~generate_oemof_links.links`.
-
-        Used for figuring out connections.
-
-    oemof_busses: ~collections.abc.Iterable
-        Iterable of :class:`oemof.solph.network.bus.Bus` objects present in the
-        same energy  system as :paramref:`~generate_oemof_links.links`.
-
-        Used for fiuring out connections
-
-
-    Return
-    ------
-    generated_links :class:`~collections.abc.Generator`
-        Generator object yielding the transformed :class:`link objects
-        <oemof.solph.custom.link.Link>`.
-
-    Examples
-    --------
-    Creating a small energy system:
-
-    >>> # utilize example hub for accessing a parameterized energy system
-    >>> import tessif.examples.data.tsf.py_hard as tsf_py
-    >>> es = tsf_py.create_fpwe()
-    """
-
-    bus_dict = {bus.label.name: bus for bus in oemof_busses}
-    tessif_busses = list(tessif_busses)
-
-    for link in links:
-        # dicts being passed to create the link
-        inputs = dict()
-        outputs = dict()
-        conversion_factors = dict()
-
-        # iterate through all tessif busses to figure out connection uid
-        for bus in tessif_busses:
-
-            # iterate through all link inputs...
-            for input_ in link.inputs:
-
-                # .. to match input string and bus uid
-                if input_ in str(bus.uid):
-
-                    # parse conversion factor:
-                    # order of busses vary depending on user input...
-                    for bus_tuple, conv_factor in link.conversions.items():
-                        # .. to parse conversion factors in the right order
-                        # check if current input uid (= the bus uid) matches
-                        # the FIRST tuple entry
-                        if str(bus.uid) == str(bus_tuple[0]):
-
-                            # the resulting tuple key is constructed by taking
-                            # the first input uid as first entry and the output
-                            # uid (the one left in the conversion factors bus
-                            # tuple) as second entry
-                            t = (bus_dict[bus.uid.name],
-                                 bus_dict[bus_tuple[1]])
-                            conversion_factors[t] = conv_factor
-
-                    # parse input flow (oemof flows are keyed to objects!)
-                    inputs[bus_dict[bus.uid.name]] = solph.Flow()
-                    # **_parse_oemof_flow_parameters(link, input_))
-
-            # to the same for outputs as for the inputs (see comments there)...
-            for output in link.outputs:
-
-                if output in str(bus.uid):
-                    # but leave out the conversion factor parsing since each
-                    # connecting bus will serve as input (and hence gets
-                    # iterated over using the inputs)
-
-                    # parse input flow (oemof flows are keyed to objects!)
-                    outputs[bus_dict[bus.uid.name]] = solph.Flow()
-                    #  **_parse_oemof_flow_parameters(link, output) )
-
-        yield solph.custom.Link(
-            label=nts.Uid(*link.uid),
-            outputs=outputs,
-            inputs=inputs,
-            conversion_factors=conversion_factors,
-        )
-
-
-def generate_oemof_sinks(sinks, tessif_busses, oemof_busses):
-    """
-    Generates oemof sinks out of tessif sinks.
-
-    Parameters
-    ----------
-    sinks: ~collections.abc.Iterable
-        Iterable of :class:`tessif.model.components.Sink` objects that are to
-        be transformed into :class:`oemof.solph.network.sink.Sink` objects.
-
-    tessif_busses: ~collections.abc.Iterable
-        Collection of :class:`tessif.model.components.Bus` objects present
-        in the same energy system as :paramref:`~generate_oemof_sinks.sinks`.
-
-        Used for figuring out connections.
-
-    oemof_busses: ~collections.abc.Iterable
-        Iterable of :class:`oemof.solph.network.bus.Bus` objects present in the
-        same energy system as :paramref:`~generate_oemof_sinks.sinks`.
-
-        Used for fiuring out connections
-
-    Return
-    ------
-    generated_sinks :class:`~collections.abc.Generator`
-        Generator object yielding the transformed :class:`sink objects
-        <oemof.solph.network.bus.Bus>`.
-
-    Examples
-    --------
-    >>> # utilize example hub for accessing a parameterized energy system
-    >>> import tessif.examples.data.tsf.py_hard as tsf_py
-    >>> es = tsf_py.create_fpwe()
-
-    >>> # generate the sinks:
-    >>> sink = list(generate_oemof_sinks(
-    ...     sinks=es.sinks,
-    ...     tessif_busses=es.busses,
-    ...     oemof_busses=generate_oemof_busses(es.busses)))[0]
-
-    >>> print(sink.label)
-    Demand
-
-    >>> linear_flow_params = (
-    ...     'nominal_value', 'summed_min', 'summed_max',
-    ...     'min', 'max', 'positive_gradient', 'negative_gradient')
-
-    >>> for flow in sink.inputs.values():
-    ...     print('Linear flow parameters:')
-    ...     for attr in linear_flow_params:
-    ...         print('{}:'.format(attr), getattr(flow, attr))
-    Linear flow parameters:
-    nominal_value: 11
-    summed_min: None
-    summed_max: None
-    min: []
-    max: []
-    positive_gradient: {'ub': [], 'costs': 0}
-    negative_gradient: {'ub': [], 'costs': 0}
-    """
-    bus_dict = {bus.label.name: bus for bus in oemof_busses}
-    tessif_busses = list(tessif_busses)
-
-    for sink in sinks:
-        inputs = dict()
-        for bus in tessif_busses:
-            for input_ in sink.inputs:
-                bus_id = ".".join([sink.uid.name, input_])
-                if bus_id in bus.outputs:
-                    inputs[bus_dict[bus.uid.name]] = solph.Flow(
-                        **_parse_oemof_flow_parameters(sink, input_)
-                    )
-
-        yield solph.Sink(label=nts.Uid(*sink.uid), inputs=inputs)
-
-
-def generate_oemof_sources(sources, tessif_busses, oemof_busses):
-    """
-    Generates oemof sources out of tessif sources.
-
-    Parameters
-    ----------
-    sources: ~collections.abc.Iterable
-        Iterable of :class:`tessif.model.components.Source` objects that are to
-        be transformed into :class:`oemof.solph.network.source.Source` objects.
-
-    tessif_busses: ~collections.abc.Iterable
-        Collection of :class:`tessif.model.components.Bus` objects present
-        in the same energy system as
-        :paramref:`~generate_oemof_sources.sources`.
-
-        Used for figuring out connections.
-
-    oemof_busses: ~collections.abc.Iterable
-        Iterable of :class:`oemof.solph.network.bus.Bus` objects present in the
-        same energy system as :paramref:`~generate_oemof_sources.sources`.
-
-        Used for fiuring out connections
-
-    Return
-    ------
-    generated_sources :class:`~collections.abc.Generator`
-        Generator object yielding the transformed :class:`source objects
-        <oemof.solph.network.bus.Bus>`.
-
-    Examples
-    --------
-    >>> # utilize example hub for accessing a parameterized energy system
-    >>> import tessif.examples.data.tsf.py_hard as tsf_py
-    >>> es = tsf_py.create_fpwe()
-
-    >>> # generate the sources:
-    >>> source = list(generate_oemof_sources(
-    ...     sources=es.sources,
-    ...     tessif_busses=es.busses,
-    ...     oemof_busses=generate_oemof_busses(es.busses)))[0]
-
-    >>> print(source.label)
-    Gas Station
-
-    >>> linear_flow_params = (
-    ...     'nominal_value', 'summed_min', 'summed_max',
-    ...     'min', 'max', 'positive_gradient', 'negative_gradient')
-
-    >>> for flow in source.outputs.values():
-    ...     print('Linear flow parameters:')
-    ...     for attr in linear_flow_params:
-    ...         print('{}:'.format(attr), getattr(flow, attr))
-    Linear flow parameters:
-    nominal_value: 100
-    summed_min: None
-    summed_max: None
-    min: []
-    max: []
-    positive_gradient: {'ub': [], 'costs': 0}
-    negative_gradient: {'ub': [], 'costs': 0}
-    """
-    bus_dict = {bus.label.name: bus for bus in oemof_busses}
-
-    tessif_busses = list(tessif_busses)
-    for source in sources:
-        outputs = dict()
-        for bus in tessif_busses:
-            for output in source.outputs:
-
-                # reconstruct the connecting bus id...
-                bus_id = ".".join([source.uid.name, output])
-
-                # and check if it is an existing one by comparing it to all
-                # bus inputs
-                if bus_id in bus.inputs:
-                    outputs[bus_dict[bus.uid.name]] = solph.Flow(
-                        **_parse_oemof_flow_parameters(source, output)
-                    )
-
-        yield solph.Source(label=nts.Uid(*source.uid), outputs=outputs)
-
-
-def generate_oemof_storages(storages, tessif_busses, oemof_busses):
-    """
-    Generates oemof storages out of tessif storages.
-
-    Parameters
-    ----------
-    storages: ~collections.abc.Iterable
-        Iterable of :class:`tessif.model.components.Storage` objects that
-        are to be transformed into :class:`oemof.solph.network.storage.Storage`
-        objects.
-
-    tessif_busses: ~collections.abc.Iterable
-        Collection of :class:`tessif.model.components.Bus` objects present
-        in the same energy system as
-        :paramref:`~generate_oemof_storages.storages`.
-
-        Used for figuring out connections.
-
-    oemof_busses: ~collections.abc.Iterable
-        Iterable of :class:`oemof.solph.network.bus.Bus` objects present in the
-        same energy system as :paramref:`~generate_oemof_storages.storages`.
-
-        Used for fiuring out connections.
-
-    Return
-    ------
-    generated_storages :class:`~collections.abc.Generator`
-        Generator object yielding the transformed :class:`storage objects
-        <oemof.solph.network.bus.Bus>`.
-
-    Examples
-    --------
-    >>> # utilize example hub for accessing a parameterized energy system
-    >>> import tessif.examples.data.tsf.py_hard as tsf_py
-    >>> es = tsf_py.create_fpwe()
-
-    >>> # generate the storages:
-    >>> storage = list(generate_oemof_storages(
-    ...     storages=es.storages,
-    ...     tessif_busses=es.busses,
-    ...     oemof_busses=generate_oemof_busses(es.busses)))[0]
-
-    Storage Uid:
-
-    >>> print(storage.label)
-    Battery
-
-    Storage in and outflow efficiencies:
-
-    >>> print('inflow:', storage.inflow_conversion_factor[12371293])
-    inflow: 1
-
-    >>> print('outflow:', storage.inflow_conversion_factor[107088076])
-    outflow: 1
-
-    Idle Changes:
-
-    >>> print(storage.loss_rate[12371203])
-    0.1
-
-    Initial State Of Charge:
-
-    >>> print(storage.initial_storage_level)
-    1.0
-
-    Flows:
-
-    >>> linear_flow_params = (
-    ...     'nominal_value', 'summed_min', 'summed_max', 'min', 'max',
-    ...     'positive_gradient', 'negative_gradient', 'variable_costs',
-    ...     'emissions',)
-
-    >>> for flow in list(
-    ...     storage.inputs.values())+list(storage.outputs.values()):
-    ...     print("Flow from '{}' to '{}'".format(
-    ...         flow.label.input, flow.label.output))
-    ...     print('Linear flow parameters')
-    ...     for attr in linear_flow_params:
-    ...         print('{}:'.format(attr), getattr(flow, attr))
-    Flow from 'Powerline' to 'Battery'
-    Linear flow parameters
-    nominal_value: 30
-    summed_min: None
-    summed_max: None
-    min: []
-    max: []
-    positive_gradient: {'ub': [], 'costs': 0}
-    negative_gradient: {'ub': [], 'costs': 0}
-    variable_costs: []
-    emissions: 0
-    Flow from 'Battery' to 'Powerline'
-    Linear flow parameters
-    nominal_value: 30
-    summed_min: None
-    summed_max: None
-    min: []
-    max: []
-    positive_gradient: {'ub': [], 'costs': 0}
-    negative_gradient: {'ub': [], 'costs': 0}
-    variable_costs: []
-    emissions: 0
-    """
-    bus_dict = {bus.label.name: bus for bus in oemof_busses}
-    tessif_busses = list(tessif_busses)
-
-    for storage in storages:
-        # dicts being passed to create the storage
-        inputs = dict()
-        outputs = dict()
-        outflow_conversion_factor = {}
-
-        for bus in tessif_busses:
-
-            inp = storage.input
-            bus_id = ".".join([storage.uid.name, inp])
-            if bus_id in bus.outputs:
-
-                # parse inflow efficiency
-                inflow_conversion_factor = storage.flow_efficiencies[inp].inflow
-
-                # parse input flow
-                inflow_parameters = _parse_oemof_flow_parameters(storage, inp)
-
-                # reset emission and costs, so they are attributed only
-                # to the outflow
-                inflow_parameters["emissions"] = 0
-                inflow_parameters["variable_costs"] = 0
-
-                inflow = solph.Flow(**inflow_parameters)
-
-                # (oemof flows are keyed to objects!)
-                inputs[bus_dict[bus.uid.name]] = inflow
-
-            output = storage.output
-            bus_id = ".".join([storage.uid.name, output])
-            if bus_id in bus.inputs:
-                # parse inflow efficiency
-                outflow_conversion_factor = storage.flow_efficiencies[output].outflow
-
-                # parse input flow (oemof flows are keyed to objects!)
-                outputs[bus_dict[bus.uid.name]] = solph.Flow(
-                    **_parse_oemof_flow_parameters(storage, output)
+            inferred_transformers['links'].append(transformer.uid)
+
+        # generators
+        elif (
+                transformer.uid.node_type in [*power_plant, *heat_plant] or
+                (
+                    len(transformer.outputs) == 1 and
+                    len(transformer.inputs) == 1
                 )
+        ):
+            inferred_transformers['generators'].append(transformer.uid)
 
-        # compare initial and final soc
-        balanced = False
-        if storage.final_soc is not None:
-            if storage.initial_soc == storage.final_soc:
-                balanced = True
-
-        if storage.capacity != 0:
-            # normalize loss rate and initial state of charge
-            initial_storage_level = storage.initial_soc / storage.capacity
-            loss_rate = (
-                storage.idle_changes.negative - storage.idle_changes.positive
-            ) / storage.capacity
-        else:
-            initial_storage_level = 0
-            loss_rate = 0
-
-        # Initialize default "capacity" Investment (expansion problem)
-        if storage.expandable["capacity"]:
-
-            max_expansion = storage.expansion_limits["capacity"].max - \
-                storage.capacity
-
-            min_expansion = storage.expansion_limits["capacity"].min - \
-                storage.capacity
-
-            if max_expansion < 0:
-                msg = (
-                    "Requested maximum expansion limit of "
-                    + f"'{storage.expansion_limits['capacity'].max}' of storage "
-                    f"'{storage.uid.name}' is below current installed "
-                    f"capacity of '{storage.capacity}' Falling back on "
-                    "current installed capacity as maximum Therefore adding 0 "
-                    "additional capacity."
-                )
-                logger.warning(msg)
-                max_expansion = 0.0
-
-            elif max_expansion == float("+inf"):
-                # oemofs inf expansion == None
-                max_expansion = None
-
-            if min_expansion < 0:
-                msg = (
-                    "Requested minimum expansion limit of "
-                    + f"'{storage.expansion_limits['capacity'].min}' of storage "
-                    f"'{storage.uid.name}' is below current installed "
-                    f"capacity of '{storage.capacity}' Falling back on 0.0 as "
-                    "minimum additionally installed capacity."
-                )
-                logger.warning(msg)
-                min_expansion = 0.0
-
-            capacity_investment = solph.Investment(
-                ep_costs=storage.expansion_costs["capacity"],
-                existing=storage.capacity,
-                minimum=min_expansion,
-                maximum=max_expansion,
-            )
-
-            nominal_storage_capacity = None
-
-            # check for fixed capacty/outflow relation
-            if storage.fixed_expansion_ratios[f"{storage.output}"]:
-                if storage.capacity != 0:
-                    output_capacity_relation = (
-                        storage.flow_rates[f"{storage.output}"].max / storage.capacity
-                    )
-
-                else:
-                    msg = (
-                        f"Storage '{storage.uid.name}' is requested to have "
-                        f"an initial capacity of '{storage.capacity}' as "
-                        "well as a fixed output expansion ratio. "
-                        "falling back to an unfixed ratio, to allow "
-                        "succesful optimization."
-                    )
-
-                    logger.warning(msg)
-                    output_capacity_relation = None
-            else:
-                output_capacity_relation = None
-
-            if storage.fixed_expansion_ratios[f"{storage.input}"]:
-                if storage.capacity != 0:
-                    input_capacity_relation = (
-                        storage.flow_rates[f"{storage.input}"].max / storage.capacity
-                    )
-
-                else:
-                    msg = (
-                        f"Storage '{storage.uid.name}' is requested to have "
-                        f"an initial capacity of '{storage.capacity}' as "
-                        "well as a fixed input expansion ratio. "
-                        "falling back to an unfixed ratio, to allow "
-                        "succesful optimization."
-                    )
-
-                    logger.warning(msg)
-                    input_capacity_relation = None
-            else:
-                input_capacity_relation = None
-
-        else:
-            capacity_investment = None
-            nominal_storage_capacity = storage.capacity
-            input_capacity_relation = None
-            output_capacity_relation = None
-
-        storage = solph.components.GenericStorage(
-            label=nts.Uid(*storage.uid),
-            nominal_storage_capacity=nominal_storage_capacity,
-            inputs=inputs,
-            outputs=outputs,
-            loss_rate=loss_rate,
-            initial_storage_level=initial_storage_level,
-            inflow_conversion_factor=inflow_conversion_factor,
-            outflow_conversion_factor=outflow_conversion_factor,
-            balanced=balanced,
-            investment=capacity_investment,
-            invest_relation_input_capacity=input_capacity_relation,
-            invest_relation_output_capacity=output_capacity_relation,
-        )
-
-        # todo: overhaul logging concept
-        # create a logging entry when overhauling the logging concept
-        # print()
-        # print(79*'#')
-        # print('cap:', storage.nominal_storage_capacity)
-        # print('loss rate:', storage.loss_rate[0])
-        # print('init soc:', storage.initial_storage_level)
-        # print('out_conv:', storage.outflow_conversion_factor[0])
-        # print('in_conv:', storage.inflow_conversion_factor[0])
-        # print('balanced:', storage.balanced)
-        # if capacity_investment:
-        #     print('min_inv:', capacity_investment.minimum)
-        #     print('max_inv:', capacity_investment.maximum)
-        #     print('existing:', capacity_investment.existing)
-        #     print('costs:', capacity_investment.ep_costs)
-
-        # print('input_capacity_relation:', input_capacity_relation)
-        # print('output_capacity_relation:', output_capacity_relation)
-        # print(79*'#')
-        # print()
-
-        yield storage
+    return inferred_transformers
 
 
-def generate_oemof_transformers(transformers, tessif_busses, oemof_busses):
+def compute_unneeded_supply_chains(tessif_es, pypsa_generator_uids):
     """
-    Generates oemof transformers out of tessif transformers.
+    Utility to compute unneeded tessif components uids.
 
-    Parameters
-    ----------
-    transformers: ~collections.abc.Iterable
-        Iterable of :class:`tessif.model.components.Transformer` objects that
-        are to be transformed into :class:`oemof.solph.network.transformer.Transformer`
-        objects.
-
-    tessif_busses: ~collections.abc.Iterable
-        Collection of :class:`tessif.model.components.Bus` objects present
-        in the same energy system as
-        :paramref:`~generate_oemof_transformers.transformers`.
-
-        Used for figuring out connections.
-
-    oemof_busses: ~collections.abc.Iterable
-        Iterable of :class:`oemof.solph.network.bus.Bus` objects present in the
-        same energy system as
-        :paramref:`~generate_oemof_transformers.transformers`.
-
-        Used for figuring out connections.
-
-    Return
-    ------
-    generated_transformers :class:`~collections.abc.Generator`
-        Generator object yielding the transformed :class:`transformer objects
-        <oemof.solph.network.bus.Bus>`.
-
-    Examples
-    --------
-    >>> # utilize example hub for accessing a parameterized energy system
-    >>> import tessif.examples.data.tsf.py_hard as tsf_py
-    >>> es = tsf_py.create_fpwe()
-
-    >>> # generate the transformers:
-    >>> transformer = list(generate_oemof_transformers(
-    ...     transformers=es.transformers,
-    ...     tessif_busses=es.busses,
-    ...     oemof_busses=generate_oemof_busses(es.busses)))[0]
-
-    Label:
-
-    >>> print(transformer.label)
-    Generator
-
-    Conversion Factors:
-
-    >>> for key, value in transformer.conversion_factors.items():
-    ...     print('{}: {}'.format(key, value[123123]))
-    Powerline: 0.42
-    Pipeline: 1
-
-    >>> linear_flow_params = (
-    ...     'nominal_value', 'summed_min', 'summed_max',
-    ...     'min', 'max', 'positive_gradient', 'negative_gradient')
-
-    >>> for flow in list(
-    ...     transformer.inputs.values())+list(transformer.outputs.values()):
-    ...     print("Flow from '{}' to '{}'".format(
-    ...         flow.label.input, flow.label.output))
-    ...     print('Linear flow parameters')
-    ...     for attr in linear_flow_params:
-    ...         print('{}:'.format(attr), getattr(flow, attr))
-    ...     print()
-    Flow from 'Pipeline' to 'Generator'
-    Linear flow parameters
-    nominal_value: 50
-    summed_min: None
-    summed_max: None
-    min: []
-    max: []
-    positive_gradient: {'ub': [], 'costs': 0}
-    negative_gradient: {'ub': [], 'costs': 0}
-    <BLANKLINE>
-    Flow from 'Generator' to 'Powerline'
-    Linear flow parameters
-    nominal_value: 15
-    summed_min: None
-    summed_max: None
-    min: []
-    max: []
-    positive_gradient: {'ub': [], 'costs': 0}
-    negative_gradient: {'ub': [], 'costs': 0}
-    <BLANKLINE>
-    """
-    bus_dict = {bus.label.name: bus for bus in oemof_busses}
-    tessif_busses = list(tessif_busses)
-
-    for transformer in transformers:
-        # dicts being passed to create the transformer
-        inputs = dict()
-        outputs = dict()
-        conversion_factors = dict()
-
-        # temp dict for translating tessif's conversions to oemof's
-        oemof_conversions = _to_oemof_conversions(transformer.conversions)
-        for bus in tessif_busses:
-            for input_ in transformer.inputs:
-                bus_id = ".".join([transformer.uid.name, input_])
-                if bus_id in bus.outputs:
-
-                    # parse conversion factor if applicable:
-                    if input_ in oemof_conversions:
-                        conversion_factors[bus_dict[bus.uid.name]] = oemof_conversions[
-                            input_
-                        ]
-
-                    # parse input flow (oemof flows are keyed to objects!)
-                    inputs[bus_dict[bus.uid.name]] = solph.Flow(
-                        **_parse_oemof_flow_parameters(transformer, input_)
-                    )
-
-            for output in transformer.outputs:
-                bus_id = ".".join([transformer.uid.name, output])
-                if bus_id in bus.inputs:
-                    # parse conversion factor if applicable:
-                    if output in oemof_conversions:
-                        conversion_factors[bus_dict[bus.uid.name]] = oemof_conversions[
-                            output
-                        ]
-
-                    # parse input flow (oemof flows are keyed to objects!)
-                    outputs[bus_dict[bus.uid.name]] = solph.Flow(
-                        **_parse_oemof_flow_parameters(transformer, output)
-                    )
-
-        yield solph.Transformer(
-            label=nts.Uid(*transformer.uid),
-            outputs=outputs,
-            inputs=inputs,
-            conversion_factors=conversion_factors,
-        )
-
-
-def transform(tessif_es, **kwargs):
-    """
-    Transform a tessif energy system into an oemof energy system.
+    Due to transforming certain :class:`tessif transformers
+    <tessif.model.components.Transformer>`  into `pypsa generators
+    <https://pypsa.readthedocs.io/en/stable/components.html#generator>`__
+    corresponding supply chains (usually a :class:`tessif bus
+    <tessif.model.components.Bus>` and a :class:`tessif source
+    <tessif.model.components.Source>`) are not needed and hence need to be
+    removed, to allow succesfull optimization.
 
     Parameters
     ----------
     tessif_es: :class:`tessif.model.energy_system.AbstractEnergySystem`
-        The tessif energy system that is to be transformed into an
-        oemof energy system.
+        The tessif energy system of which the :paramref:`generator
+        <pypsa_generator_uids>` supply chains are to be removed.
+
+    pypsa_generator_uids: ~collections.abc.Iterable
+        Iterable of :class:`tessif transformers
+        <tessif.model.components.Transformer>` of which the corresponding
+        supply chains need to be removed.
+        Returned by :func:`infer_pypsa_transformer_types` ['generators'] by
+        design.
 
     Return
     ------
-    oemof_es: :class:`oemof.solph.network.energy_system.EnergySystem`
-        The oemof energy system that was transformed out of the tessif
-        energy system.
+    components_to_remove: dict
+        Dictionairy of componend uid lists keyed by pypsa component type of
+        components which are to be removed.
+    """
+    busses_to_remove, components_to_remove = list(), list()
+    supply_chains = collections.defaultdict(list)
 
-    Examples
-    --------
-    Use the :ref:`example hub's <Examples>`
-    :meth:`~tessif.examples.data.tsf.py_hard.create_mwe` utility for showcasing
-    basic usage:
+    # Create a list of busses, that are to be removed
+    for transformer in tessif_es.transformers:
+        if transformer.uid in pypsa_generator_uids:
 
-    1. Create the mwe:
+            # iterate through all transformer inputs to get all connecting
+            # busses
+            for inbound in transformer.inputs:
+                # Busses To Remove = btrs
+                btrs = list()
 
-        >>> from tessif.examples.data.tsf.py_hard import create_mwe
-        >>> tessif_es = create_mwe()
+                # iterate through all tessif busses
+                for bus in tessif_es.busses:
 
-    2. Transform the :mod:`tessif energy system
-       <tessif.model.energy_system.AbstractEnergySystem>`:
+                    # to find the generator to be removed input:
+                    if any([outbound == f'{transformer.uid.name}.{inbound}'
+                            for outbound in bus.outputs]):
 
-        >>> oemof_es = transform(tessif_es)
+                        # and then check whether the bus from which this input
+                        # comes only feeds transformer that are to be
+                        # generators
+                        incoming_bus_outbounds = [
+                            outbound.split('.')[0]
+                            for outbound in bus.outputs]
 
-    3. Show node labels using the :attr:`oemof interface
-       <oemof.network.Node.label>` as well as :mod:`tessif's uid concept
-       <tessif.frused.namedtuples.Uid>`:
+                        generators_to_remove = [
+                            uid.name for uid in pypsa_generator_uids]
 
-        >>> for node in oemof_es.nodes:
-        ...     print(node.label.name)
-        Pipeline
-        Powerline
-        Gas Station
-        Demand
-        Generator
-        Battery
+                        # print(79*'-')
+                        # print(bus.uid.name)
+                        # print([outbound.split('.')[0]
+                        #        for outbound in bus.outputs])
+                        # print([uid.name for uid in pypsa_generator_uids])
+                        # print(79*'-')
 
-    4. Simulate the oemof energy system:
+                        # if (
+                        #         len(bus.outputs) == 1 and
+                        #         len(bus.inputs) == 1
+                        # ):
 
-        >>> import tessif.simulate as simulate
-        >>> optimized_oemof_es = simulate.omf_from_es(oemof_es)
+                        if all([bus_outbound in generators_to_remove
+                                for bus_outbound in incoming_bus_outbounds]):
 
-    5. Extract some results:
+                            if bus not in busses_to_remove:
+                                btrs.append(bus)
 
-        >>> import tessif.transform.es2mapping.omf as transform_oemof_results
-        >>> load_results = transform_oemof_results.LoadResultier(
-        ...     optimized_oemof_es)
-        >>> print(load_results.node_load['Powerline'])
-        Powerline            Battery  Generator  Battery  Demand
-        1990-07-13 00:00:00    -10.0       -0.0      0.0    10.0
-        1990-07-13 01:00:00     -0.0      -10.0      0.0    10.0
-        1990-07-13 02:00:00     -0.0      -10.0      0.0    10.0
-        1990-07-13 03:00:00     -0.0      -10.0      0.0    10.0
+                busses_to_remove.extend(btrs)
+                supply_chains[transformer.uid].extend(btrs)
 
-    |
+                # iterate through all supplying busses to remove subsequent
+                # sources
+                for bus in btrs:
+                    for inbound in bus.inputs:
 
-    **A slightly more advanced example:**
+                        ctrs = [
+                            comp for comp in tessif_es.nodes
+                            if any([inbound == f'{str(comp.uid)}.{interface}'
+                                    for interface in comp.interfaces])
+                        ]
 
-    >>> from tessif.examples.data.tsf.py_hard import create_fpwe
-    >>> tessif_es = create_fpwe()
-    >>> oemof_es = transform(tessif_es)
-    >>> optimized_oemof_es = simulate.omf_from_es(oemof_es)
-    >>> load_results = transform_oemof_results.LoadResultier(
-    ...     optimized_oemof_es)
-    >>> print(load_results.node_load['Powerline'])
-    Powerline            Battery  Generator  Solar Panel  Battery  Demand
-    1990-07-13 00:00:00     -0.0       -0.0        -12.0      1.0    11.0
-    1990-07-13 01:00:00     -8.0       -0.0         -3.0      0.0    11.0
-    1990-07-13 02:00:00     -0.9       -3.1         -7.0      0.0    11.0
+                        supply_chains[transformer.uid].extend(ctrs)
+
+    # Add all of the busses inputs to the components that are to be removed:
+    for bus in busses_to_remove:
+        # Components To Remove = ctrs
+        for inbound in bus.inputs:
+
+            ctrs = [
+                comp for comp in tessif_es.nodes
+                if any([inbound == f'{comp.uid.name}.{interface}'
+                        for interface in comp.interfaces])
+            ]
+            components_to_remove.extend(ctrs)
+
+    components_to_remove = {
+        'Bus': [str(bus.uid) for bus in busses_to_remove],
+        'Generator': [str(gen.uid) for gen in components_to_remove],
+        'supply_chains': supply_chains,
+    }
+
+    return components_to_remove
+
+
+def parse_flow_parameters(component, interface):
+    """
+    Utility to parse flow related parameters from :mod:`Tessif components
+    <tessif.model.components>` to `Pypsa components
+    <https://pypsa.readthedocs.io/en/latest/components.html>`_
+
+    Parameters
+    ----------
+    component: :class:`tessif.model.components.AbstractEsComponent`
+        Tessif component of which it's flow related parameters are parsed
+        into pypsa recognizable parameters
+    interface: str
+        String representing the flow related interface from the components
+        point of view. One of the components
+        :attr:`~tessif.model.components.AbstractEsComponent.interfaces`.
+
+    Return
+    ------
+    parsed_flow_parameters: dict
+        Dictionairy representing the parsed flow parameters ready to be used
+        as key word arguments for creating pypsa components.
+
+    Raises
+    ------
+    ValueError:
+        A value error is raised in case a nominal_value (max flow_rate value)
+        is requested to be infinit AND in addition to milp parameters.
+
+        This is due to the fact that an infinit nominal value is parsed into an
+        expansion problem because pypsa can not deal with infinity values.
+        Which in turn causes conflicts in dealing with milp parameters.
+    """
+    # pypsa interprets many parameters as normalized to the nominal
+    # value
+    nominal_value = component.flow_rates[interface].max
+    if isinstance(nominal_value, collections.abc.Iterable):
+        nominal_value = max(nominal_value)
+
+    # linear constraints
+    flow_params = dict()
+    if nominal_value != float('inf'):
+        # infinity values are handled below
+        flow_params['p_nom'] = nominal_value
+
+        if nominal_value != 0:
+
+            flow_params['p_min_pu'] = component.flow_rates[
+                interface].min / nominal_value
+            flow_params['p_max_pu'] = component.flow_rates[
+                interface].max / nominal_value
+        else:
+            flow_params['p_min_pu'] = 0
+            flow_params['p_max_pu'] = 1
+
+    flow_params['marginal_cost'] = component.flow_costs[interface]
+
+    # linear commitment constraints
+    if component._milp[interface]:
+        flow_params.update(
+            {
+                'committable': True,
+                'start_up_cost': component.status_changing_costs.on,
+                'shut_down_cost': component.status_changing_costs.off,
+                # 'ramp_limit_start_up': component.flow_gradients[
+                #     interface].positive,
+                # 'ramp_limit_shut_down': component.flow_gradients[
+                #     interface].negative,
+                'min_up_time': component.status_inertia.on,
+                'min_down_time': component.status_inertia.off,
+
+                # following milp constraints are not supported by pypsa:
+                # activity_costs: component.costs_for_being_active,
+                # initial_status: component.initial_status,
+                # number_of_shutdowns: component.number_of_status_changes[
+                #    interface].off
+                # number_of_start_ups: component.number_of_status_changes[
+                #    interface].on
+
+                # following constraints are not supported by tessif:
+                # ramp_limit_start_up
+                # ramp_limit_shut_down
+                # down_time_before
+            }
+        )
+        # parse gradients (which can be infinite in tessif
+        positive_gradient = component.flow_gradients[interface].positive
+        if positive_gradient == float('+inf'):
+            flow_params['ramp_limit_up'] = 1.0
+        else:
+            flow_params['ramp_limit_up'] = positive_gradient/nominal_value
+
+        negative_gradient = component.flow_gradients[interface].negative
+        if negative_gradient == float('+inf'):
+            flow_params['ramp_limit_down'] = 1.0
+        else:
+            flow_params['ramp_limit_down'] = negative_gradient/nominal_value
+
+        # parse initial status
+        if component.initial_status:
+            flow_params['up_time_before'] = 1.0
+        else:
+            flow_params['up_time_before'] = 0.0
+
+    # expansion constraints
+    if component.expandable[interface]:
+        # expansion and milp/commitment constraints are not compatible
+        flow_params['committable'] = False
+        flow_params.update(
+            {
+                'p_nom_extendable': True,
+                'p_nom_max': component.expansion_limits[interface].max,
+                'p_nom_min': component.expansion_limits[interface].min,
+                'capital_cost': component.expansion_costs[interface],
+            }
+        )
+
+        if component.timeseries is not None:
+            if interface in component.timeseries:
+
+                # warn the user in case maximum minimum time series is higher
+                # than the minimum expansion, what make ppsa think it can sell
+                # the component to make money
+                if 'p_nom_min' in flow_params:
+                    if flow_params['p_nom_min'] < component.flow_rates[
+                            interface].max:
+                        msg = (
+                            "Minimum stated expansion limit "
+                            f"(''{flow_params['p_nom_min']}'') of component "
+                            f"''{component.uid.name}'' is lower than the "
+                            "maximum stated flow rate value of "
+                            f"''{component.flow_rates[interface].max}''."
+                            "\n This may lead to pypsa selling the component "
+                            "for the stated expansions costs, and hence "
+                            "yield quite unpredictable results.\n\n"
+                            "To avoid that, explicitly state the minimum and "
+                            "maximum expansion limits of this component."
+                        )
+                        logger.warning(msg)
+
+        elif 'p_nom_min' in flow_params:
+            if flow_params['p_nom_min'] < component.flow_rates[interface].max:
+                msg = (
+                    "Minimum stated expansion limit "
+                    f"(''{flow_params['p_nom_min']}'') of component "
+                    f"''{component.uid.name}'' is lower than the "
+                    "maximum stated flow rate value of "
+                    f"''{component.flow_rates[interface].max}''."
+                    "\n This may lead to pypsa selling the component "
+                    "for the stated expansions costs, and hence "
+                    "yield quite unpredictable results.\n\n"
+                    "To avoid that, explicitly state the minimum and "
+                    "maximum expansion limits of this component."
+                )
+                logger.warning(msg)
+
+    # handle tessif's infinity values
+    if nominal_value == float('inf'):
+        # infinity values are handled by setting installed_capacity and
+        # expansion_costs 0
+
+        # milp + expansion cant be handled on the same flow
+        if component._milp[interface]:
+            msg = (
+                "Pypsa cannot handle infinity nominal value and milp\n"
+                "constraints at the same time for a singular flow."
+            )
+            raise ValueError(msg)
+
+        # Handle case, the user wanted it to be expandable anyways:
+        if component.expandable[interface]:
+
+            flow_params['p_nom'] = 0.0
+            flow_params['p_nom_extendable'] = True
+            flow_params['p_min_pu'] = 0.0
+            flow_params['p_max_pu'] = 1.0
+
+            # handle implied flow_rate settings by passing a timeseries:
+            if component.expansion_costs[interface] != 0:
+                if component.timeseries:
+                    if component.timeseries[interface] is not None:
+                        # preset nominal value to distinguish use cases
+                        flow_params['p_nom'] = max(
+                            component.timeseries[interface].max)
+
+                    else:
+                        msg = (
+                            "nominal_value == float('inf') & expansion_costs "
+                            "!= 0.\n\n"
+                            "Infinity nominal values in pypsa are handled by "
+                            "setting them to 0 while making them expandable.\n"
+                            "Expansion costs are currently set to non-zero. "
+                            "Be aware that the sum of constraints as well as "
+                            "the results might be different from what you "
+                            "expect.\n"
+                        )
+                        logger.warning(msg)
+
+        # Fall back on installed_cap & exp_cost = 0
+        else:
+            flow_params['p_nom'] = 0.0
+            flow_params['p_nom_min'] = 0.0
+            flow_params['p_nom_max'] = float('inf')
+            flow_params['p_nom_extendable'] = True
+            flow_params['capital_cost'] = 0
+            flow_params['p_min_pu'] = 0.0
+            flow_params['p_max_pu'] = 1.0
+
+        for key, value in flow_params.copy().items():
+            if isinstance(value, numbers.Number):
+                if value == float('inf'):
+                    if key != 'p_nom_max':
+                        flow_params[key] = 1.0
+
+    # handle tessif's timeseries arguments
+    if component.timeseries is not None:
+        if interface in component.timeseries:
+
+            if flow_params['p_nom'] != 0:
+                flow_params['p_min_pu'] = np.array(component.timeseries[
+                    interface].min) / flow_params['p_nom']
+                flow_params['p_max_pu'] = np.array(component.timeseries[
+                    interface].max) / flow_params['p_nom']
+            else:
+                min_nominal_value = max(component.timeseries[interface].min)
+                if min_nominal_value != 0:
+                    flow_params['p_min_pu'] = np.array(component.timeseries[
+                        interface].min) / min_nominal_value
+
+                else:
+                    flow_params['p_min_pu'] = 0.0
+
+                max_nominal_value = max(component.timeseries[interface].max)
+                if max_nominal_value != 0:
+                    flow_params['p_max_pu'] = np.array(component.timeseries[
+                        interface].max) / max(
+                            component.timeseries[interface].max)
+                else:
+                    flow_params['p_max_pu'] = 1.0
+
+            # warn the user in case maximum minimum time series is higher than
+            # the minimum expansion, what make ppsa think it can sell
+            # the component to make money
+            if 'p_nom_min' in flow_params:
+                if flow_params['p_nom_min'] < max(
+                        component.timeseries[interface].max):
+                    msg = (
+                        "Minimum stated expansion limit "
+                        f"(''{flow_params['p_nom_min']}'') of component "
+                        f"''{component.uid.name}'' is lower than the maximum "
+                        "stated timeseries value of "
+                        f"''{max(component.timeseries[interface].max)}''.\n"
+                        "This may lead to pypsa selling the component "
+                        "for the stated expansions costs, and hence "
+                        "yield quite unpredictable results.\n\n"
+                        "To avoid that, explicitly state the minimum and "
+                        "maximum expansion limits of this component."
+                    )
+                    logger.warning(msg)
+
+    return flow_params
+
+
+def create_pypsa_busses(busses):
+    """
+    Creates pypsa buses out of tessif busses.
+
+    Parameters
+    ----------
+    busses: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Bus` objects that are to
+        be transformed into `bus
+        <https://pypsa.readthedocs.io/en/stable/components.html#bus>`_
+        objects.
+
+    Return
+    ------
+    :class:`~collections.abc.Sequence`
+        Sequence of pypsa dictionairies representing the `bus
+        <https://pypsa.readthedocs.io/en/stable/components.html#bus>`_
+        components.
+    """
+    tessif_busses = list(busses)
+
+    pypsa_bus_dicts = list()
+    for bus in tessif_busses:
+        pypsa_bus_dicts.append(
+            {
+                'class_name': 'Bus',
+                'name': str(bus.uid),
+                'x': bus.uid.longitude,
+                'y': bus.uid.latitude,
+                'carrier': bus.uid.carrier
+            }
+        )
+
+    return pypsa_bus_dicts
+
+
+def create_pypsa_generators_from_sources(sources, tessif_busses):
+    """
+    Create pypsa generators out of tessif sources.
+
+    Parameters
+    ----------
+    sources: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Source` objects that are to
+        be transformed into `generator
+        <https://pypsa.readthedocs.io/en/stable/components.html#generator>`_
+        objects.
+
+    tessif_busses: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Bus` objects present
+        in the same energy system as
+        :paramref:`~create_pypsa_generators_from_sources.sources`.
+
+    Return
+    ------
+    :class:~collections.abc.Sequence
+        Sequence of pypsa dictionairies representing the `generator
+        <https://pypsa.readthedocs.io/en/stable/components.html#generator>`_
+        components representing tessif sources.
+
+    Note
+    ----
+    Tessif sources can have multiple outputs, pypsa generators not.
+    So in case a tessif source requests to have multiple outputs, a singular
+    pypsa generator is created for each output.
+    """
+    tessif_sources = list(sources)
+    tessif_busses = list(tessif_busses)
+
+    pypsa_generator_dicts = list()
+    pypsa_carrier_dicts = list()
+    for source in tessif_sources:
+        for output in source.outputs:
+            for bus in tessif_busses:
+
+                # reconstruct the connecting bus id...
+                source_outp_bus_id = '.'.join([source.uid.name, output])
+
+                # and check if it is an existing one by comparing it to all
+                # bus inputs
+                if source_outp_bus_id in bus.inputs:
+                    # if the right one is found break out of the loop
+                    pypsa_bus_uid = bus.uid
+                    break
+
+            new_gen = {
+                'class_name': 'Generator',
+                'name': str(source.uid),
+                'bus': str(pypsa_bus_uid),
+                'carrier': source.uid.carrier,
+            }
+
+            # check for generators of the same name present already
+            counter = 0
+            for generator_dict in pypsa_generator_dicts:
+                if generator_dict['name'] == new_gen['name']:
+                    counter += 1
+
+            if counter != 0:
+                new_gen['name'] = f'{str(source.uid)}_{counter}'
+
+            new_gen.update(
+                parse_flow_parameters(source, output)
+            )
+
+            # parse efficiency
+            if hasattr(source, 'conversions'):
+                for key, efficiency in source.conversions.items():
+                    if output in key:
+                        new_gen['efficiency'] = efficiency
+
+            else:
+                new_gen['efficiency'] = 1.0
+
+            # parse emissions
+            carrier_dict = {}
+            emissions = source.flow_emissions[output]
+            if emissions > 0:
+                # individualize carrier for each generator
+                new_gen['carrier'] = f"{new_gen['name']}.carrier"
+
+                # create pypsa parseable carrier dict to constrain emissions
+                carrier_dict.update(
+                    {
+                        'class_name': 'Carrier',
+                        'name': new_gen['carrier'],
+                        'co2_emissions': emissions * new_gen['efficiency']
+                    }
+                )
+
+            new_gen['flow_emissions'] = emissions
+
+            # print(79*'-')
+            # print(new_gen)
+            # print(79*'-')
+
+            pypsa_generator_dicts.append(new_gen)
+
+            # only add carriers if needed
+            if len(carrier_dict) > 0:
+                pypsa_carrier_dicts.append(carrier_dict)
+
+    return [*pypsa_generator_dicts, *pypsa_carrier_dicts]
+
+
+def create_pypsa_sinks(sinks, tessif_busses, timeseries='max'):
+    """
+    Create pypsa generators out of tessif sinks.
+
+    Parameters
+    ----------
+    sinks: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Sink` objects that are to
+        be transformed into `load
+        <https://pypsa.readthedocs.io/en/stable/components.html#load>`_
+        objects.
+
+    tessif_busses: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Bus` objects present
+        in the same energy system as
+        :paramref:`~create_pypsa_generators_from_sources.sources`.
+
+    timeseries: str, ['max', 'min', 'avg']
+        String specifying how to handle timeseries values.
+        Since `pypsa loads
+        <https://pypsa.readthedocs.io/en/stable/components.html#load>`_
+        can only handle fixed timeseries values (in contrast to time varying
+        range of lower and upper load limits), a flag has to be stated
+        how timeseries values are to be handled.
+
+        Must be one of:
+
+            - ``max`` (default):
+
+                :attr:`flow_rate.max <tessif.model.components.Sink.flow_rates>`
+                is used, for setting the timeseries values.
+
+            - ``min`` (default):
+
+                :attr:`flow_rate.min <tessif.model.components.Sink.flow_rates>`
+                is used, for setting the timeseries values.
+
+            - ``avg``:
+
+                The average of each time step between
+                :attr:`flow_rate.min and flow_rate.max
+                <tessif.model.components.Sink.flow_rates>` is used.
+
+    Return
+    ------
+    :class:`~collections.abc.Sequence`
+        Sequence of pypsa dictionairies representing the `load
+        <https://pypsa.readthedocs.io/en/stable/components.html#load>`_
+        components representing tessif sinks.
+    """
+    tessif_sinks = list(sinks)
+    tessif_busses = list(tessif_busses)
+
+    pypsa_load_dicts = list()
+    for sink in tessif_sinks:
+        for inbound in sink.inputs:
+            for bus in tessif_busses:
+
+                # reconstruct the connecting bus id...
+                source_outp_bus_id = '.'.join([sink.uid.name, inbound])
+
+                # and check if it is an existing one by comparing it to all
+                # bus outputs
+                if source_outp_bus_id in bus.outputs:
+                    # if the right one is found break out of the loop
+                    pypsa_bus_uid = bus.uid
+                    break
+
+            new_load = {
+                'class_name': 'Load',
+                'name': str(sink.uid),
+                'bus': str(pypsa_bus_uid),
+            }
+
+            new_load.update(
+                parse_flow_parameters(sink, inbound)
+            )
+
+            # parse the general flow parameters into arguments the load "class"
+            # comprehends:
+
+            if timeseries == 'max':
+                new_load['p_set'] = new_load['p_max_pu'] * new_load['p_nom']
+
+            elif timeseries == 'min':
+                new_load['p_set'] = new_load['p_min_pu'] * new_load['p_nom']
+
+            elif timeseries == 'avg':
+                new_load['p_set'] = (
+                    np.mean(
+                        list(
+                            zip(
+                                new_load['p_min_pu'], new_load['p_max_pu']
+                            )
+                        ),
+                        axis=1)
+                    * new_load['p_nom']
+                )
+
+            # pop general flow parameters the load "class" cannot comprehend:
+            # print(79*'-')
+            # print(new_load)
+            # print(79*'-')
+
+            for flow_param in [
+                    'p_min_pu', 'p_max_pu', 'marginal_cost', 'p_nom',
+                    'p_nom_min', 'p_nom_max', 'capital_cost',
+                    'p_nom_extendable']:
+                if flow_param in new_load:
+                    new_load.pop(flow_param)
+
+            pypsa_load_dicts.append(new_load)
+
+    return pypsa_load_dicts
+
+
+def create_pypsa_excess_sinks(sinks, tessif_busses):
+    """
+    Create pypsa generators out of tessif sinks.
+
+    Parameters
+    ----------
+    sinks: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Sink` objects that are to
+        be transformed into `storage units
+        <https://pypsa.readthedocs.io/en/stable/components.html#storage-unit>`_
+        objects.
+
+    tessif_busses: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Bus` objects present
+        in the same energy system as
+        :paramref:`~create_pypsa_generators_from_sources.sources`.
+
+
+    Return
+    ------
+    :class:`~collections.abc.Sequence`
+        Sequence of pypsa dictionairies representing the `storage unit
+        <https://pypsa.readthedocs.io/en/stable/components.html#storage-unit>`_
+        components representing tessif excess sinks.
+    """
+    tessif_sinks = list(sinks)
+    tessif_busses = list(tessif_busses)
+
+    pypsa_storage_unit_dicts = list()
+    for sink in tessif_sinks:
+        for inbound in sink.inputs:
+            for bus in tessif_busses:
+
+                # reconstruct the connecting bus id...
+                source_outp_bus_id = '.'.join([sink.uid.name, inbound])
+
+                # and check if it is an existing one by comparing it to all
+                # bus outputs
+                if source_outp_bus_id in bus.outputs:
+                    # if the right one is found break out of the loop
+                    pypsa_bus_uid = bus.uid
+                    break
+
+            new_bus_unit = {
+                'class_name': 'Bus',
+                'name': "-".join([str(sink.uid), "Bus"]),
+                "type": "ignore",
+            }
+            new_link_unit = {
+                "class_name": "Link",
+                'name': "-".join([str(sink.uid), "Link"]),
+                'bus0': str(pypsa_bus_uid),
+                'bus1': "-".join([str(sink.uid), "Bus"]),
+                "type": "ignore",
+                'efficiency': 1.0,
+                'p_min_pu': -1.0,
+                'marginal_cost': 0,
+                'p_nom_extendable': True,
+                'capital_cost': 0,
+            }
+            new_storage_unit = {
+                'class_name': 'StorageUnit',
+                'name': str(sink.uid),
+                'bus': "-".join([str(sink.uid), "Bus"]),
+                "type": "excess_sink",
+            }
+
+            new_storage_unit.update(
+                parse_flow_parameters(sink, inbound)
+            )
+
+            # new_storage_unit["e_nom_extendable"] = True
+            new_storage_unit["capital_cost"] = 0
+
+            # make excess sink aka storage able to storage_unit energy
+            new_storage_unit["p_min_pu"] = -1.0
+            # but do not allow energy dispatch
+            new_storage_unit["p_max_pu"] = 0.0
+
+            # transfer excess costs to link, so pypsa recognizes:
+            new_link_unit["marginal_cost"] = new_storage_unit["marginal_cost"]
+
+            # print(79*'-')
+            # print(new_storage_unit)
+            # print(79*'-')
+            pypsa_storage_unit_dicts.append(new_bus_unit)
+            pypsa_storage_unit_dicts.append(new_link_unit)
+            pypsa_storage_unit_dicts.append(new_storage_unit)
+
+    return pypsa_storage_unit_dicts
+
+
+def create_pypsa_generators_from_transformers(transformers, tessif_busses):
+    """
+    Create pypsa generators out of tessif transformers.
+
+    Parameters
+    ----------
+    transformers: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Transformer` objects that
+        are to be transformed into `generator
+        <https://pypsa.readthedocs.io/en/stable/components.html#generator>`_
+        objects.
+
+    tessif_busses: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Bus` objects present
+        in the same energy system as
+        :paramref:`~create_pypsa_generators_from_transformers.transformers`.
+
+    Return
+    ------
+    :class:~collections.abc.Sequence
+        Sequence of pypsa dictionairies representing the `generator
+        <https://pypsa.readthedocs.io/en/stable/components.html#generator>`_
+        components representing tessif transformers.
+
+    Note
+    ----
+    Tessif transformers can have multiple outputs, pypsa generators not.
+    So in case a tessif transformer requests to have multiple outputs, a
+    singular pypsa generator is created for each output.
     """
 
-    oemof_busses = list(generate_oemof_busses(tessif_es.busses))
+    return create_pypsa_generators_from_sources(
+        sources=transformers,
+        tessif_busses=tessif_busses)
 
-    energy_system_components = list()
-    energy_system_components.extend(oemof_busses)
 
-    for link in generate_oemof_links(
-        links=tessif_es.connectors,
-        tessif_busses=tessif_es.busses,
-        oemof_busses=oemof_busses,
+def create_pypsa_links_from_transformers(transformers, tessif_busses):
+    """
+    Create pypsa links out of tessif transformers.
+
+    Parameters
+    ----------
+    transformers: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Transformer` objects that
+        are to be transformed into `link
+        <https://pypsa.readthedocs.io/en/stable/components.html#link>`_
+        objects.
+
+    tessif_busses: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Bus` objects present
+        in the same energy system as
+        :paramref:`~create_pypsa_links_from_transformers.transformers`.
+
+    Return
+    ------
+    :class:~collections.abc.Sequence
+        Sequence of pypsa dictionairies representing the `link
+        <https://pypsa.readthedocs.io/en/stable/components.html#link>`_
+        components representing tessif transformers.
+
+    Warning
+    -------
+    In case of chp transformation pypsa uses the highest installed capacity as
+    reference capacity to calculate outgoing flows using the respective
+    conversion factors.
+
+    Make sure the conversion factors reflect the expected
+    installed capacities. If target capacaties are 100 and 50, make sure
+    conversion factors are of ration 2/1 (i.e 0.6 and 0.3).
+
+    Raises
+    ------
+    NotImplementedError
+        Raised if more than 1 input is used, because tessif can't handle this
+        case yet.
+    """
+
+    tessif_transformers = list(transformers)
+    tessif_busses = list(tessif_busses)
+
+    pypsa_link_dicts = list()
+    pypsa_carrier_dicts = list()
+
+    for transformer in tessif_transformers:
+        input_busses = dict()
+        output_busses = dict()
+        emissions, costs, capacities, expansion_costs = list(), list(), list(), list()
+        efficiencies = list()
+
+        for bus in tessif_busses:
+            for pos, inbound in enumerate(transformer.inputs):
+
+                # reconstruct the connecting bus id...
+                transformer_input_bus_id = '.'.join(
+                    [transformer.uid.name, inbound])
+
+                # and check if it is an existing one by comparing it to all
+                # bus outputs
+                if transformer_input_bus_id in bus.outputs:
+                    # if the right one is found store it pypsa compatibly
+                    input_busses[f'bus{pos}'] = str(bus.uid)
+
+        for bus in tessif_busses:
+            # inbound needs to be found before outbound
+            # that's why tessif busses are iterated twice
+            for pos, output in enumerate(transformer.outputs):
+
+                # reconstruct the connecting bus id...
+                transformer_outp_bus_id = '.'.join(
+                    [transformer.uid.name, output])
+
+                # and check if it is an existing one by comparing it to all
+                # bus inputs
+                if transformer_outp_bus_id in bus.inputs:
+                    # if the right one is found store it pypsa compatibly
+                    output_busses[f'bus{len(input_busses)+pos}'] = str(bus.uid)
+
+                    # costs
+                    costs.append(
+                        transformer.flow_costs[output])
+
+                    # expansion costs
+                    expansion_costs.append(
+                        transformer.expansion_costs[output])
+
+                    # emissions
+                    emissions.append(
+                        transformer.flow_emissions[output])
+
+                    # installed capacity
+                    frate = transformer.flow_rates[output].max
+                    if isinstance(frate, collections.abc.Iterable):
+                        frate = max(frate)
+                    capacities.append(frate)
+
+                    for conversion in transformer.conversions:
+                        if output in conversion:
+                            efficiencies.append(
+                                transformer.conversions[conversion])
+
+        # sort efficiency, costs, emissions and capacity for highest capacity
+        # so the highest capacity outflow represent p_nom
+
+        output_bound_params = pd.DataFrame(
+            data=zip(capacities, efficiencies, costs, expansion_costs,
+                     emissions, output_busses.values()),
+            columns=('capacities', 'efficiencies', 'costs',
+                     'expansion_costs', 'emissions', 'busses'),
+        )
+
+        output_bound_params = output_bound_params.sort_values(
+            by='capacities',
+            axis='index',
+            ascending=False,
+        )
+
+        capacities = list(output_bound_params['capacities'])
+        costs = list(output_bound_params['costs'])
+        expansion_costs = list(output_bound_params['expansion_costs'])
+        emissions = list(output_bound_params['emissions'])
+        efficiencies = list(output_bound_params['efficiencies'])
+
+        # output busses need to be parsed in a special manner
+        output_bus_list = list(output_bound_params['busses'])
+        output_busses = dict()
+        for counter, bus in enumerate(output_bus_list):
+            output_busses[f'bus{len(input_busses)+counter}'] = bus
+
+        # parse the efficiencies for pypsa to understand
+        if len(input_busses) > 1 or len(output_busses) > 1:
+
+            # mimo transformer
+            if len(input_busses) > 1 and len(output_busses) > 1:
+                raise NotImplementedError
+
+            # miso transformer
+            elif len(input_busses) > 1:
+                raise NotImplementedError
+
+            # simo transformer, usually chps
+            elif len(output_busses) > 1:
+
+                # parse installed capacities
+                parsed_capacities = dict()
+                for counter, capacity in enumerate(capacities):
+                    if capacity == float('+inf'):
+                        capacity = 0
+                    else:
+                        capacity /= efficiencies[counter]
+                    parsed_capacities[f"p_nom{counter+1}"] = capacity
+
+                parsed_capacities['p_nom'] = parsed_capacities.pop("p_nom1")
+
+                # parse efficiencies
+                parsed_efficiencies = dict()
+
+                for counter, efficiency in enumerate(efficiencies):
+
+                    # hack inside the efficiency to account for p_nom1+
+                    # which only works if it is not extendable
+
+                    # if counter != 0 and parsed_capacities['p_nom'] != 0:
+                    #     p_nomi = parsed_capacities[f"p_nom{counter+1}"]
+                    #     efficiency = p_nomi/parsed_capacities[
+                    #         'p_nom'] * efficiency
+
+                    parsed_efficiencies[f"efficiency{counter+1}"] = efficiency
+
+                parsed_efficiencies[
+                    'efficiency'] = parsed_efficiencies.pop("efficiency1")
+
+                # parse costs
+                parsed_costs = dict()
+
+                for counter, cost in enumerate(costs):
+
+                    parsed_costs[f"flow_costs{counter+1}"] = cost
+
+                parsed_costs[
+                    'flow_costs'] = parsed_costs.pop("flow_costs1")
+
+                # parse expansion costs
+                parsed_expansion_costs = dict()
+
+                for counter, exp_cost in enumerate(expansion_costs):
+
+                    parsed_expansion_costs[f"expansion_costs{counter+1}"] = exp_cost
+
+                parsed_expansion_costs[
+                    'expansion_costs'] = parsed_expansion_costs.pop("expansion_costs1")
+
+                # parse emissions
+                parsed_emissions = dict()
+
+                for counter, emission in enumerate(emissions):
+                    parsed_emissions[f"flow_emissions{counter+1}"] = emission
+
+                parsed_emissions[
+                    'flow_emissions'] = parsed_emissions.pop("flow_emissions1")
+
+        # siso transformer
+        else:
+
+            siso_output = tuple(transformer.outputs)[0]
+            parsed_efficiencies = {
+                "efficiency": list(transformer.conversions.values())[0]}
+            parsed_emissions = {
+                'flow_emissions': transformer.flow_emissions[
+                    siso_output]}
+            parsed_costs = {
+                'flow_costs': transformer.flow_costs[
+                    siso_output]}
+            parsed_expansion_costs = {
+                'expansion_costs': transformer.expansion_costs[
+                    siso_output]}
+
+            # p_nom in links refers to highest occurring flow. so in the
+            # context of a siso transformer, this means the input. Hence the
+            # tessif output needs to be divided by its efficiency:
+            cap = transformer.flow_rates[siso_output].max
+            if isinstance(cap, collections.abc.Iterable):
+                cap = max(cap)
+
+            # distinguish between time series efficiencies (e.g. temp dependet
+            # heat pump) and singular value sisos:
+            eff = parsed_efficiencies['efficiency']
+            if isinstance(eff, collections.abc.Iterable):
+                eff = min(eff)
+
+            parsed_capacities = {'p_nom': cap / eff}
+
+            if cap == float("+inf"):
+                parsed_capacities = {"p_nom": 0}
+            else:
+                parsed_capacities = {'p_nom': cap / eff}
+
+            # output = siso_output
+
+        # add post processor tags, if necessary
+        post_processor_tags = dict()
+        if len(input_busses) > 1:
+            post_processor_tags['multiple_inputs'] = True
+
+        if len(output_busses) > 1:
+            post_processor_tags['multiple_outputs'] = True
+
+        if len(output_busses) == len(input_busses) == 1:
+            post_processor_tags['siso_transformer'] = True
+
+        new_link = {
+            'class_name': 'Link',
+            'name': str(transformer.uid),
+            **parsed_efficiencies,
+            **input_busses,
+            **output_busses,
+            **post_processor_tags,
+            **parsed_costs,
+            **parsed_expansion_costs,
+            **parsed_emissions,
+        }
+
+        parsed_flow_parameters = parse_flow_parameters(transformer, output)
+
+        # pypsa link costs are evaluated before efficiency, hence tessif's
+        # flow specific cost approach is modeled by calculating the sum of
+        # the products of each flow cost by its efficiency i.e:
+        # c = c_th * eta_th + c_el * eta_el for a chp:
+        parsed_flow_parameters['marginal_cost'] = 0
+        for cost, efficiency in zip(costs, efficiencies):
+
+            # for time varying efficiencies the maximum is used
+            if isinstance(efficiency, collections.abc.Iterable):
+                parsed_flow_parameters['marginal_cost'] = [
+                    cost * entry for entry in efficiency]
+
+            else:
+                parsed_flow_parameters['marginal_cost'] += cost * efficiency
+
+        parsed_flow_parameters['marginal_cost']
+        new_link.update(**parsed_flow_parameters)
+        # print(79*'-')
+        # print(parsed_flow_parameters)
+        # print(79*'-')
+
+        # account for siso corrected capacities in case of extendable capacity:
+        # note extend to all links
+        # if len(input_busses) == len(output_busses) == 1:
+
+        if 'p_nom_extendable' in new_link:
+            if (
+                    new_link['p_nom'] == new_link['p_nom_min'] and
+                    new_link['p_nom_extendable']
+            ):
+                parsed_capacities['p_nom_min'] = parsed_capacities['p_nom']
+
+            # capital costs need to be multiplied with efficiency as pypsa
+            # calculates with the highest flow,
+            # which is usually the input cause efficiencies smaller than 1
+            new_link['capital_cost'] = 0
+            for out in transformer.outputs:
+                for key, efficiency in transformer.conversions.items():
+                    if out in key:
+                        # for time varying efficiencies the maximum is used
+                        if isinstance(efficiency, collections.abc.Iterable):
+                            efficiency = max(efficiency)
+
+                        new_link['capital_cost'] += transformer.expansion_costs[f'{out}'] * efficiency
+        else:
+            new_link['capital_cost'] = 0
+            for i in range(len(expansion_costs)):
+                if i == 0:
+                    new_link['expansion_costs'] = 0
+                else:
+                    new_link[f'expansion_costs{i+1}'] = 0
+
+        new_link.update(**parsed_capacities)
+
+        # account for input based capacity on extendable links;
+        # set min expansion to input corrected capacity:
+
+        # if new_link['p_nom_min'] < new_link['p_nom']:
+        #     new_link['p_nom_min'] = new_link['p_nom']
+
+        # parse emissions, so pypsa respects them:
+        input_attributed_emissions = np.dot(
+            tuple(parsed_emissions.values()),
+            tuple(parsed_efficiencies.values())
+        )
+
+        if isinstance(input_attributed_emissions, collections.abc.Iterable):
+
+            input_attributed_emissions = max(input_attributed_emissions)
+            if input_attributed_emissions > 0:
+                logger.warning("Due to time varying efficiencies,")
+                logger.warning(f"component '{new_link['name']}'")
+                logger.warning(
+                    "may not have their emissions allocated correctly.")
+                logger.warning("Emissions at maxiimum efficiency are used")
+
+        carrier_dict = dict()
+        if input_attributed_emissions > 0:
+            new_link['carrier'] = f"{new_link['name']}.carrier"
+
+            # create pypsa parseable carrier dict to constrain emissions
+            carrier_dict = {
+                'class_name': 'Carrier',
+                'name': new_link['carrier'],
+                'co2_emissions': input_attributed_emissions,
+            }
+
+        # pop general flow parameters the link "class" cannot comprehend:
+        for flow_param in ['committable']:
+            if flow_param in new_link:
+                new_link.pop(flow_param)
+
+        pypsa_link_dicts.append(new_link)
+
+        # only add carriers if needed
+        if len(carrier_dict) > 0:
+            pypsa_carrier_dicts.append(carrier_dict)
+
+    return [*pypsa_link_dicts, *pypsa_carrier_dicts]
+
+
+def create_pypsa_connectors(connectors, tessif_busses):
+    """
+    Create pypsa links out of tessif connectors.
+
+    Parameters
+    ----------
+    connectors: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Connector` objects that
+        are to be transformed into `link
+        <https://pypsa.readthedocs.io/en/stable/components.html#link>`_
+        objects.
+
+    tessif_busses: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Bus` objects present
+        in the same energy system as
+        :paramref:`~create_pypsa_links_from_connectors.connectors`.
+
+    Return
+    ------
+    :class:~collections.abc.Sequence
+        Sequence of pypsa dictionairies representing the `link
+        <https://pypsa.readthedocs.io/en/stable/components.html#link>`_
+        components representing tessif connectors.
+
+    Note
+    ----
+    Transforming :class:`tessif connectors <tessif.model.components.Connector>`
+    to `pypsa links
+    <https://pypsa.readthedocs.io/en/stable/components.html#link>`__
+    following compatibility issues are faced:
+
+        - Pypsa links are one-directional according to their efficiency
+          calculations. For bidirectional tessif links to make sense,
+          bidirectional pypsa links are set to an efficiency of 1.0.
+        - Tessif connectors are not designed to constrain their flows,
+          where as pypsa links are. Therefor pypsa links created from
+          tessif connectors are parameterized as follows:
+
+            1. nominal capacity is extendable having no extension costs
+            2. specific min/max power flow is set to -1.0/1.0 respectively
+            3. flow specific costs are set to 0.0
+    """
+
+    tessif_connectors = list(connectors)
+    tessif_busses = list(tessif_busses)
+
+    pypsa_link_dicts = list()
+    for connector in tessif_connectors:
+
+        new_link = {
+            'class_name': 'Link',
+            'name': str(connector.uid),
+            'bus0': sorted(list(connector.inputs))[0],
+            'bus1': sorted(list(connector.inputs))[1],
+            'efficiency': 1.0,
+            'p_min_pu': -1.0,
+            'marginal_cost': 0,
+            'p_nom_extendable': True,
+            'capital_cost': 0,
+        }
+
+        pypsa_link_dicts.append(new_link)
+
+    return pypsa_link_dicts
+
+
+def create_pypsa_storages(storages, tessif_busses):
+    """
+    Create pypsa generators out of tessif storages.
+
+    Parameters
+    ----------
+    storages: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Storage` objects that are
+        to be transformed into `generator
+        <https://pypsa.readthedocs.io/en/stable/components.html#generator>`_
+        objects.
+
+    tessif_busses: ~collections.abc.Sequence
+        Sequence of :class:`tessif.model.components.Bus` objects present
+        in the same energy system as
+        :paramref:`~create_pypsa_storages.storages`.
+
+    Return
+    ------
+    :class:`~collections.abc.Sequence`
+        Sequence of pypsa dictionairies representing the `storage
+        <https://pypsa.readthedocs.io/en/stable/components.html#storage>`_
+        components representing tessif storages.
+
+    Note
+    ----
+    Pypsa forces the ratio of capacity and output flow to be constant, even
+    during expansion. Doing that it restricts possible capacty expansion
+    in relation to out_flow expansion. Meaning, outflow expansion is subject
+    to parameterization while capacity expansion is just a subsequent
+    byproduct.
+
+    Since this seems quite unintuitive, tessif parameterizes it the other way
+    round, meaning the values for capacity expansion are enforced on the flow
+    rate expansion repsecting the stated ration of capacity to flow rate.
+    """
+    tessif_storages = list(storages)
+    tessif_busses = list(tessif_busses)
+
+    pypsa_storage_dicts = list()
+    pypsa_carrier_dicts = list()
+    for storage in tessif_storages:
+
+        for bus in tessif_busses:
+
+            inbound = storage.input
+
+            # reconstruct the connecting bus id...
+            storage_outp_bus_id = '.'.join(
+                [storage.uid.name, inbound])
+
+            # and check if it is an existing one by comparing it to all
+            # bus inputs
+            if storage_outp_bus_id in bus.outputs:
+                # if the right one is found store it pypsa compatibly
+                connecting_bus = bus.uid
+
+        # parse initial and final soc:
+        cyclic_state_of_charge = False
+        if storage.final_soc is not None:
+            if storage.initial_soc == storage.final_soc:
+                cyclic_state_of_charge = True
+
+        # parse idle changes, to deal with 0 install capacity:
+        if storage.capacity != 0:
+            standing_loss = storage.idle_changes.negative/storage.capacity
+        else:
+            standing_loss = 0
+
+        new_storage = {
+            'class_name': 'StorageUnit',
+            'name': str(storage.uid),
+            'bus': connecting_bus,
+            'max_hours': storage.capacity/storage.flow_rates[
+                storage.output].max,
+            'efficiency_store': storage.flow_efficiencies[
+                storage.input].inflow,
+            'efficiency_dispatch': storage.flow_efficiencies[
+                storage.output].outflow,
+            'state_of_charge_initial': storage.initial_soc,
+            'cyclic_state_of_charge': cyclic_state_of_charge,
+            'standing_loss': standing_loss,
+            'inflow': storage.idle_changes.positive,
+            'flow_emissions': storage.flow_emissions[storage.input]
+        }
+
+        new_storage.update(
+            parse_flow_parameters(storage, storage.input)
+        )
+
+        # pop commitable attribute, since storage ain't got one
+        if 'committable' in new_storage:
+            new_storage.pop('committable')
+
+        # default parsing set p_min_pu to 0, but it needs to be -1.0 by default
+        if new_storage['p_min_pu'] == 0.0:
+            new_storage['p_min_pu'] = -1.0
+
+        # handle infinite flow and finite capacity conflict:
+        if new_storage['max_hours'] == new_storage['p_nom'] == 0.0:
+            # if new_storage['state_of_charge_initial'] != 0.0:
+            #     new_storage['p_nom'] = new_storage['state_of_charge_initial']
+            new_storage['max_hours'] = 1.0
+
+        # storage expansion focues on capacity rather than on flow parameters
+        # so they need to be adjusted accordingly:
+        if storage.expandable['capacity']:
+            if not storage.expandable[f'{storage.output}']:
+                msg = (
+                    f"Storage '{storage.uid.name}' is requested to have "
+                    "an expandable capacity, but a non-expandable output "
+                    f"'{storage.output}'. PyPSA however fixed flow rate to "
+                    "capacity expansion. falling back to an expandable "
+                    "outflow, to allow succesful optimization."
+                )
+                logger.warning(msg)
+
+            new_storage['p_nom_extendable'] = True
+            new_storage['capital_cost'] = storage.expansion_costs['capacity'] * \
+                new_storage['max_hours']
+            new_storage['p_nom_min'] = storage.expansion_limits[
+                'capacity'].min / new_storage['max_hours']
+            new_storage['p_nom_max'] = storage.expansion_limits[
+                'capacity'].max / new_storage['max_hours']
+
+        # new_storage['state_of_charge_initial_per_period'] = True
+
+        # print(79*'-')
+        # for attr, value in new_storage.items():
+        #     print(f'{attr}: {value}')
+        # print(79*'-')
+
+        # parse emissions
+        carrier_dict = {}
+        if new_storage['flow_emissions'] > 0:
+            # individualize carrier for each storage
+            new_storage['carrier'] = f"{new_storage['name']}.carrier"
+
+            # create pypsa parseable carrier dict to constrain emissions
+            carrier_dict.update(
+                {
+                    'class_name': 'Carrier',
+                    'name': new_storage['carrier'],
+                    'co2_emissions': new_storage['flow_emissions']
+                }
+            )
+
+        new_storage['marginal_cost'] = storage.flow_costs[storage.input]
+
+        pypsa_storage_dicts.append(new_storage)
+
+        # only add carriers if needed
+        if len(carrier_dict) > 0:
+            pypsa_carrier_dicts.append(carrier_dict)
+
+    return [*pypsa_storage_dicts, *pypsa_carrier_dicts]
+
+
+def transform(tessif_es, transformer_style='infer', forced_links=None, excess_sinks=None, **kwargs):
+    """
+    Transform a tessif energy system into a pypsa energy system.
+
+    Parameters
+    ----------
+    tessif_es: :class:`tessif.model.energy_system.AbstractEnergySystem`
+        The tessif energy system that is to be transformed into a
+        pypsa energy system.
+    transformer_style: str
+        String specifying how tessif transformer should be transformed into
+        pypsa components:
+
+            - ``infer`` (default):
+
+                Transformers are treated according to
+                :func:`infer_pypsa_transformer_types` with the exception of
+                :paramref:`forced_links`, which are treated as
+                `Pypsa links
+                <https://pypsa.readthedocs.io/en/latest/components.html#link>`_
+
+            - ``links``:
+
+                All transformers are treated as links, giving up pypsa
+                commitment simulations and plant related CO2 emissions, but
+                preserving tessif energy system representation. (Meaning
+                all nodes present inside the tessif energy system will be
+                present inside the pypsa energy system.)
+
+    forced_links: ~collections.abc.Container, None, default=None
+        Container of :ref:`uid representations <Labeling_Concept>` of
+        :class:`tessif transformers <tessif.model.components.Transformer>`
+        to be transfrormed into `pypsa links
+        <https://pypsa.readthedocs.io/en/latest/components.html#link>`_.
+
+    excess_sinks: ~collections.abc.Container, None, default=None
+        Container of :ref:`uid representations <Labeling_Concept>` of
+        :class:`tessif sinks <tessif.model.components.Sink>`
+        to be transfrormed into `pypsa store units
+        <https://pypsa.readthedocs.io/en/latest/components.html#store>`_.
+
+    Return
+    ------
+    pypsa_es: :class:`pypsa.Network`
+        The pypsa energy system that was transformed out of the tessif
+        energy system.
+    """
+    # copy the existing component attribute dict:
+    custom_attributes = pypsa.descriptors.Dict(
+        {k: v.copy() for k, v in pypsa.components.component_attrs.items()}
+    )
+
+    # add flow bound emission values:
+    custom_attributes.update(
+        **pypsa_hooks.add_flow_bound_emissions(custom_attributes)
+    )
+
+    # add siso transformer label:
+    custom_attributes.update(
+        **pypsa_hooks.add_siso_transfromer_type(custom_attributes)
+    )
+
+    # scan the tessif transforms to find out if any of them fulfills one of the
+    # following condition:
+    #     - is a chp (aka uid.node_type == spellings.chp)
+    #     - number of interfaces > 2
+    # cause if so, the link component needs to be extended
+    if (
+            any([
+                len(transformer.interfaces) > 2
+                for transformer in tessif_es.transformers
+            ])
+            or
+            any([
+                transformer.uid.node_type in combined_heat_power
+                for transformer in tessif_es.transformers
+            ])
     ):
-        energy_system_components.append(link)
 
-    for source in generate_oemof_sources(
-        sources=tessif_es.sources,
-        tessif_busses=tessif_es.busses,
-        oemof_busses=oemof_busses,
-    ):
-        energy_system_components.append(source)
+        number_of_additional_interfaces = max(
+            [len(transformer.interfaces)
+             for transformer in tessif_es.transformers]
+        ) - 2  # -2, cause there are already 2 busses present by default
 
-    # add sink to the energy system nodes
-    # (e.g. demands, excess nodes, exports, ...)
+        # expand the link component using the appropriate hook
+        custom_attributes.update(
+            **pypsa_hooks.extend_number_of_link_interfaces(
+                custom_attributes,
+                additional_interfaces=number_of_additional_interfaces
+            )
+        )
 
-    for sink in generate_oemof_sinks(
-        sinks=tessif_es.sinks, tessif_busses=tessif_es.busses, oemof_busses=oemof_busses
-    ):
-        energy_system_components.append(sink)
+    # create the energy system overriding the custom component attributes
+    es = pypsa.Network(override_component_attrs=custom_attributes)
 
-    # add multiple input multiple output transformers
-    for transformer in generate_oemof_transformers(
-        transformers=tessif_es.transformers,
-        tessif_busses=tessif_es.busses,
-        oemof_busses=oemof_busses,
-    ):
-        energy_system_components.append(transformer)
+    # transform the timeframe
+    timeframe = tessif_es.timeframe
+    es.set_snapshots(timeframe)
 
-    # add single input two outputs generic chps and extraction turbine chps
-    for chp in generate_oemof_chps(
-        chps=tessif_es.chps, tessif_busses=tessif_es.busses, oemof_busses=oemof_busses
-    ):
-        energy_system_components.append(chp)
+    # transform the emission constraint:
+    for constraint, limit in tessif_es.global_constraints.items():
+        if constraint in spellings_flow_emissions:
+            if limit < float('+inf'):
 
-    # # add single input two outputs sito flex transformers
-    # for sito_flex_transformer in generate_sito_flex_transformers(
-    #         es_object_types, bus_dict):
-    #     es_nodes.append(sito_flex_transformer)
+                es.add(class_name='GlobalConstraint',
+                       name="co2_limit",
+                       sense="<=",
+                       constant=limit)
 
-    # # add single input single output offset transformers
-    # for transformer in generate_siso_nonlinear_transformers(
-    #         es_object_types, bus_dict):
-    #     es_nodes.append(transformer)
+    # list of relatively straight forward transformation
+    basic_transformations = [
+        # 'sinks',
+        'connectors',
+        'storages',
+    ]
 
-    # add generic storages
-    for storage in generate_oemof_storages(
-        storages=tessif_es.storages,
-        tessif_busses=tessif_es.busses,
-        oemof_busses=oemof_busses,
-    ):
-        energy_system_components.append(storage)
+    # transform busses first
+    for bus_dict in create_pypsa_busses(tessif_es.busses):
+        es.add(**bus_dict)
 
-    energy_system = solph.EnergySystem(timeindex=tessif_es.timeframe)
-    energy_system.add(*energy_system_components, **kwargs)
+    # transform the basic components:
+    for component in basic_transformations:
+        for comp_dict in globals()[f'create_pypsa_{component}'](
+                getattr(tessif_es, component), tessif_es.busses):
+            es.add(**comp_dict)
 
-    # add global constraints (no parsing here, since oemof allocates global
-    # constraints to the underlying solver model exclusively)
-    energy_system.global_constraints = tessif_es.global_constraints
+    # sinks -> loads
+    if not excess_sinks:
+        excess_sinks = {}  # change None to empty dict to make it iterable
 
-    return energy_system
+    for sink_dict in create_pypsa_sinks(
+            sinks=[sink for sink in tessif_es.sinks
+                   if str(sink.uid) not in excess_sinks],
+            tessif_busses=tessif_es.busses):
+
+        es.add(**sink_dict)
+
+    setattr(es, "excess_sinks", excess_sinks)
+    for storage_dict in create_pypsa_excess_sinks(
+            sinks=[sink for sink in tessif_es.sinks
+                   if str(sink.uid) in excess_sinks],
+            tessif_busses=tessif_es.busses):
+        es.add(**storage_dict)
+
+    # sources -> generators
+    for gen_dict in create_pypsa_generators_from_sources(
+            sources=tessif_es.sources,
+            tessif_busses=tessif_es.busses):
+        es.add(**gen_dict)
+
+    # For now, chps from tessif's CHP class are treated like transformers.
+    for chp_dict in create_pypsa_links_from_transformers(
+            transformers=tessif_es.chps,
+            tessif_busses=tessif_es.busses):
+        es.add(**chp_dict)
+
+    # handle the quite delicate task of transforming the transformers
+    if transformer_style == 'links':
+        for link_dict in create_pypsa_links_from_transformers(
+                tessif_es.transformers):
+            es.add(**link_dict)
+    else:
+        # transform transformer according to the inferred type:
+        transformer_types = infer_pypsa_transformer_types(
+            tessif_es.transformers,
+            forced_links=forced_links)
+
+        # transform transformers into generators:
+        for gen_dict in create_pypsa_generators_from_transformers(
+            transformers=[
+                transformer for transformer in tessif_es.transformers
+                if transformer.uid in transformer_types['generators']],
+            tessif_busses=tessif_es.busses
+        ):
+            es.add(**gen_dict)
+
+        # remove the subsequent supply chains:
+        for comp_type, components_to_remove in compute_unneeded_supply_chains(
+                tessif_es=tessif_es,
+                pypsa_generator_uids=transformer_types['generators']
+        ).items():
+            if comp_type != 'supply_chains':
+                for comp in components_to_remove:
+                    es.remove(comp_type, comp)
+            else:
+                # reallocate supply chain emission and costs to the remaining
+                # generator:
+                for gen_name, supplying_comps in components_to_remove.items():
+                    for comp in supplying_comps:
+                        # reallocate emissions if necessary
+                        if hasattr(comp, 'flow_emissions'):
+
+                            # assume component is a 1 outflow source
+                            if list(comp.flow_emissions.values())[0] > 0:
+                                # so add 1/eta * emissions to the respective
+                                # generator further down the supply chain
+                                es.generators.at[
+                                    str(gen_name), 'flow_emissions'] += (
+                                        list(comp.flow_emissions.values())[0] /
+                                        es.generators[
+                                            'efficiency'][str(gen_name)]
+                                )
+
+                                es.carriers.at[
+                                    es.generators[
+                                        'carrier'][str(gen_name)],
+                                    'co2_emissions'] += list(
+                                    comp.flow_emissions.values())[0]
+
+                        # reallocate costs if necessary
+                        if hasattr(comp, 'flow_costs'):
+                            # assume component is a 1 outflow source
+                            # so add 1/eta * emissions to the respective gen
+                            es.generators.at[str(gen_name), 'marginal_cost'] += (
+                                list(comp.flow_costs.values())[0] /
+                                es.generators['efficiency'][str(gen_name)]
+                            )
+
+        # transform transformers into links:
+        for gen_dict in create_pypsa_links_from_transformers(
+            transformers=[
+                transformer for transformer in tessif_es.transformers
+                if transformer.uid in transformer_types['links']],
+            tessif_busses=tessif_es.busses
+        ):
+            es.add(**gen_dict)
+
+    es.uid = tessif_es.uid
+
+    return es
