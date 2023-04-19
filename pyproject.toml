@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "tessif-pypsa-0-19-3"
-version = "0.1.0"
+version = "0.1.1"
 description = "Tessif-Plugin for providing pypsa version 0.19.3 support."
 authors = ["Mathias Ammon <tz3ma.coding@use.startmail.com>"]
 license = "MIT"
